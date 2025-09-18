@@ -1,6 +1,6 @@
-libs/
+# libs/
 vis/
-pointcept/
+# pointcept/
 pretrained/
 vis_mask_outputs/
 
