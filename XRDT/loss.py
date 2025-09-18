@@ -56,7 +56,7 @@ class CombinedLoss(nn.Module):
             # 只对有有效标签的样本计算损失
             lattice_loss = self.lattice_loss_fn(pred_lattice[valid_crystal_mask], target_lattice[valid_crystal_mask])
             # 防止损失值过大，使用张量方式避免同步
-            lattice_loss = torch.clamp(lattice_loss, max=torch.tensor(0.1, device=device, dtype=lattice_loss.dtype))
+            # lattice_loss = torch.clamp(lattice_loss, max=torch.tensor(0.1, device=device, dtype=lattice_loss.dtype))
 
         sg_loss = torch.tensor(0.0, device=device)
         if self.sg_weight > 0 and valid_crystal_mask.sum() > 0:

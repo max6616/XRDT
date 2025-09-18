@@ -6,7 +6,7 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from dataset import MillerDataset, collate_fn_offset
+from XRDT.dataset import MillerDataset, collate_fn_offset
 from eval import evaluate as eval_evaluate
 
 
@@ -187,12 +187,14 @@ def build_eval_loader(paths, miller_index_offset, args, fixed_clip_fraction=None
 # Scheduler helpers
 # -------------------------------
 def create_scheduler(optimizer, args, steps_per_epoch: int):
+    accum_steps = max(1, int(getattr(args, 'grad_accum_steps', 1)))
+    effective_steps = max(1, steps_per_epoch // accum_steps)
     if args.warmup_epochs > 0:
         return optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=args.lr,
             epochs=args.epochs,
-            steps_per_epoch=steps_per_epoch,
+            steps_per_epoch=effective_steps,
             pct_start=args.warmup_epochs / args.epochs,
             anneal_strategy=args.warmup_method,
         )

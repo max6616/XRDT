@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from XRDT.model import MillerIndexerV3
+from XRDT.model import XRDT
 from XRDT.dataset import MillerDataset, collate_fn_offset
 from XRDT.loss import CombinedLoss
 import warnings
@@ -27,23 +27,63 @@ from XRDT.utils import (
     run_full_eval,
 )
 
+def load_pretrained_flex(model: torch.nn.Module, ckpt_path: str):
+    print(f"--> Load pretrained weights from '{ckpt_path}' (shape-checked)")
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    state_dict = ckpt.get('model_state_dict', ckpt)
+
+    model_state = model.state_dict()
+
+    def maybe_strip_module(k: str) -> str:
+        if k.startswith('module.') and not any(s.startswith('module.') for s in model_state.keys()):
+            return k[len('module.'):]
+        return k
+
+    filtered = {}
+    loaded_keys = []
+    skipped_keys = []
+
+    for k, v in state_dict.items():
+        k2 = maybe_strip_module(k)
+        if k2 in model_state and hasattr(v, 'shape') and model_state[k2].shape == v.shape:
+            filtered[k2] = v
+            loaded_keys.append(k)
+        else:
+            skipped_keys.append(k)
+
+    missing_in_ckpt = [k for k in model_state.keys() if k not in filtered]
+
+    msg = (
+        f"--> Pretrained load summary | loaded: {len(loaded_keys)} | "
+        f"skipped(shape/key): {len(skipped_keys)} | missing_in_ckpt: {len(missing_in_ckpt)}"
+    )
+    print(msg)
+    if len(skipped_keys) > 0:
+        preview = ', '.join(skipped_keys[:10])
+        more = '' if len(skipped_keys) <= 10 else f" (+{len(skipped_keys)-10} more)"
+        print(f"--> Skipped keys (preview): {preview}{more}")
+
+    model.load_state_dict(filtered, strict=False)
+    return ckpt
+
 def get_parser():
     parser = argparse.ArgumentParser(description='XRDT')
     parser.add_argument('--model',          type=str,   default='XRDT')
     parser.add_argument('--data_paths',     nargs='+',  default=[
-                                                            '/media/max/Data/datasets/mp_random_150k_v1_canonical', 
-                                                            '/media/max/Data/datasets/mp_random_150k_v2_canonical', 
-                                                            '/media/max/Data/datasets/mp_random_150k_v3_canonical', 
+                                                            # '/media/max/Data/datasets/mp_random_150k_v1_canonical', 
+                                                            # '/media/max/Data/datasets/mp_random_150k_v2_canonical', 
+                                                            # '/media/max/Data/datasets/mp_random_150k_v3_canonical', 
+                                                            '/media/max/Data/datasets/mp_random_150k_v3_canonical_fix', 
                                                             ])
     parser.add_argument('--save_path',      type=str,   default='/media/max/Data/results/xrd_transformer/mp_random_150k_canonical')
     parser.add_argument('--pretrained',     type=str,   default=None, help='pretrained model path, only load model weights')
-    parser.add_argument('--resume',         type=str,   default=None, help='checkpoint path, load full training state')
+    parser.add_argument('--resume',         type=str,   default='/media/max/Data/results/xrd_transformer/mp_random_150k_canonical/XRDT_20250918_163226/best_model.pth', help='checkpoint path, load full training state')
     parser.add_argument('--debug',          type=int,   default=0, help='if >0, limit training set size for fast debugging')
-    parser.add_argument('--print_freq',     type=int,   default=100, help='print training info frequency (iterations)')
-    parser.add_argument('--full_eval_freq', type=int,   default=10, help='full evaluation frequency (epochs)')
-    parser.add_argument('--workers',        type=int,   default=24)
+    parser.add_argument('--print_freq',     type=int,   default=1000, help='print training info frequency (iterations)')
+    parser.add_argument('--full_eval_freq', type=int,   default=40, help='full evaluation frequency (epochs)')
+    parser.add_argument('--workers',        type=int,   default=1)
     parser.add_argument('--epochs',         type=int,   default=100)
-    parser.add_argument('--batch_size',     type=int,   default=12)
+    parser.add_argument('--batch_size',     type=int,   default=8)
     parser.add_argument('--lr',             type=float, default=5e-5)
     parser.add_argument('--weight_decay',   type=float, default=1e-4)
     parser.add_argument('--augment_angle',  type=bool,  default=True, help='enable angle augmentation')
@@ -51,13 +91,15 @@ def get_parser():
     parser.add_argument('--clip_grad_norm', type=float, default=1.0, help='max norm for gradient clipping')
     parser.add_argument('--loss_weights',   type=float, default=[1.0, 5.0, 0.2], nargs=3, help='[L_miller, L_lattice, L_sg]')
     parser.add_argument('--min_hkl',        type=int,   default=-5)
-    parser.add_argument('--max_hkl',        type=int,   default=5)
+    parser.add_argument('--max_hkl',        type=int,   default=10)
     parser.add_argument('--warmup_epochs',  type=int,   default=1)
     parser.add_argument('--warmup_method',  type=str,   default='cos', choices=['linear', 'cos'])
     # dynamic angle clipping
     parser.add_argument('--dynamic_angle_clip',     type=bool,  default=True, help='enable dynamic angle clipping')
     parser.add_argument('--angle_clip_schedule',    type=str,   default='cos', choices=['linear', 'cos'], help='dynamic angle clipping method')
-    parser.add_argument('--angle_range_low',        type=float, default=0.0278, help='angle clipping lower bound')
+    parser.add_argument('--angle_range_low',        type=float, default=0.083334, help='angle clipping lower bound')
+    # gradient accumulation
+    parser.add_argument('--grad_accum_steps',       type=int,   default=4, help='number of micro-steps to accumulate before optimizer step')
     return parser
 
 def save_checkpoint(state, is_best, save_path):
@@ -119,6 +161,7 @@ def train_one_epoch(loader, model, criterion, optimizer, scaler, epoch, writer, 
     start_time = time.time()
     optimizer.zero_grad(set_to_none=True)
     last_clip_lower_now = None
+    accum_steps = max(1, int(getattr(args, 'grad_accum_steps', 1)))
     
     for i, (coords, feats, miller_labels, offsets, crystal_labels, sample_info_list) in enumerate(loader):
         coords, feats, miller_labels, offsets = coords.cuda(non_blocking=True), feats.cuda(non_blocking=True), miller_labels.cuda(non_blocking=True), offsets.cuda(non_blocking=True)
@@ -139,17 +182,20 @@ def train_one_epoch(loader, model, criterion, optimizer, scaler, epoch, writer, 
             loss_dict = criterion(predictions, miller_labels, crystal_labels, offsets)
             loss = loss_dict['total_loss']
 
-        scaler.scale(loss).backward()
+        # scale loss for gradient accumulation
+        loss_scaled = loss / accum_steps
+        scaler.scale(loss_scaled).backward()
         
-        scaler.unscale_(optimizer)
-        if args.clip_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad_norm)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-        
-        if scheduler is not None and isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
-            scheduler.step()
+        do_step = ((i + 1) % accum_steps == 0) or (i + 1 == len(loader))
+        if do_step:
+            scaler.unscale_(optimizer)
+            if args.clip_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            if scheduler is not None and isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
+                scheduler.step()
         
         if (i + 1) % args.print_freq == 0:
             elapsed = time.time() - start_time
@@ -157,7 +203,6 @@ def train_one_epoch(loader, model, criterion, optimizer, scaler, epoch, writer, 
             if args.dynamic_angle_clip and last_clip_lower_now is not None:
                 extra_clip = f" | ClipLower: {last_clip_lower_now:.4f}"
             print(f"Epoch: [{epoch+1}/{args.epochs}][{i+1}/{len(loader)}] | "
-                f"Memory: {torch.cuda.max_memory_allocated() / 1024**2:.1f}MB | "
                 f"Loss: {loss.detach().item():.4f} | "
                 f"L_miller: {loss_dict['loss_miller'].detach().item():.4f} | "
                 f"L_h: {loss_dict['loss_h'].detach().item():.4f} | "
@@ -228,7 +273,7 @@ def main():
     print(f"--> Input feature dim: {in_channels}, Miller classes: {num_classes}")
     assert in_channels == 4, f"Input feature dim should be 4, got {in_channels}"
 
-    model = MillerIndexerV3(in_channels=in_channels, num_classes=num_classes).cuda()
+    model = XRDT(in_channels=in_channels, num_classes=num_classes).cuda()
     print(f"--> Model params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f} M")
     
     criterion = CombinedLoss(miller_weight=args.loss_weights[0], lattice_weight=args.loss_weights[1], sg_weight=args.loss_weights[2]).cuda()
@@ -251,9 +296,7 @@ def main():
         start_epoch = ckpt['epoch'] + 1
         best_val_acc = ckpt.get('best_val_acc', 0.0)
     elif args.pretrained:
-        print(f"--> Load pretrained weights from '{args.pretrained}'")
-        ckpt = torch.load(args.pretrained, map_location='cpu', weights_only=False)
-        model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        ckpt = load_pretrained_flex(model, args.pretrained)
 
     try:
         args.total_iters = args.epochs * len(train_loader)
@@ -264,9 +307,7 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         train_one_epoch(train_loader, model, criterion, optimizer, scaler, epoch, writer, args, scheduler)
         
-        if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
-            pass
-        else:
+        if not isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
             scheduler.step()
         
         print("--> Fast evaluation...")

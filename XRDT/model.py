@@ -8,8 +8,8 @@ import torch_scatter
 from timm.layers import DropPath
 
 import flash_attn
-from libs.pointcept.models.utils.structure import Point
-from libs.pointcept.models.modules import PointModule, PointSequential
+from pointcept.models.utils.structure import Point
+from pointcept.models.modules import PointModule, PointSequential
 
 def offset2bincount(offset):
     return torch.diff(
@@ -64,9 +64,9 @@ class SerializedAttention(PointModule):
         self.enable_rpe = enable_rpe
         self.enable_flash = enable_flash and flash_attn is not None
         if self.enable_flash:
-            assert not enable_rpe, "当启用 Flash Attention 时，请将 enable_rpe 设置为 False"
-            assert not upcast_attention, "当启用 Flash Attention 时，请将 upcast_attention 设置为 False"
-            assert not upcast_softmax, "当启用 Flash Attention 时，请将 upcast_softmax 设置为 False"
+            assert not enable_rpe
+            assert not upcast_attention
+            assert not upcast_softmax
             self.patch_size = patch_size
             self.attn_drop = attn_drop
         else:
@@ -287,16 +287,6 @@ class Embedding(PointModule):
         return self.stem(point)
 
 class PointTransformerV3(PointModule):
-    # def __init__(
-    #     self, in_channels=6, order=("z", "z-trans"), stride=(2, 2, 4, 4),
-    #     enc_depths=(4, 6, 4, 3, 2), enc_channels=(32, 64, 128, 128, 128),
-    #     enc_num_head=(2, 4, 8, 8, 8), enc_patch_size=(24, 24, 24, 24, 24),
-    #     dec_depths=(2, 3, 4, 4), dec_channels=(32, 64, 128, 128),
-    #     dec_num_head=(2, 4, 8, 8), dec_patch_size=(24, 24, 24, 24),
-    #     mlp_ratio=4, qkv_bias=True, qk_scale=None, attn_drop=0.0, proj_drop=0.0, drop_path=0.3,
-    #     pre_norm=True, shuffle_orders=True, enable_rpe=False, enable_flash=True,
-    #     upcast_attention=False, upcast_softmax=False, cls_mode=False
-    # ):
     def __init__(
         self, in_channels=6, order=("z", "z-trans"), stride=(2, 2, 2, 2),
         enc_depths=(4, 6, 4, 3, 2), enc_channels=(64, 128, 256, 512, 1024),
@@ -307,6 +297,16 @@ class PointTransformerV3(PointModule):
         pre_norm=True, shuffle_orders=True, enable_rpe=False, enable_flash=True,
         upcast_attention=False, upcast_softmax=False, cls_mode=False
     ):
+    # def __init__(
+    #     self, in_channels=6, order=("z", "z-trans"), stride=(2, 2, 2, 2),
+    #     enc_depths=(2, 2, 2, 2, 2), enc_channels=(16, 32, 64, 128, 256),
+    #     enc_num_head=(2, 4, 8, 16, 32), enc_patch_size=(48, 48, 48, 48, 48),
+    #     dec_depths=(2, 2, 2, 2), dec_channels=(32, 32, 64, 128),
+    #     dec_num_head=(2, 4, 8, 16), dec_patch_size=(48, 48, 48, 48),
+    #     mlp_ratio=2, qkv_bias=True, qk_scale=None, attn_drop=0.0, proj_drop=0.0, drop_path=0.3,
+    #     pre_norm=True, shuffle_orders=True, enable_rpe=False, enable_flash=True,
+    #     upcast_attention=False, upcast_softmax=False, cls_mode=False
+    # ):
         super().__init__()
         self.num_stages, self.order, self.cls_mode, self.shuffle_orders = len(enc_depths), [order] if isinstance(order, str) else order, cls_mode, shuffle_orders
         
@@ -351,15 +351,12 @@ class PointTransformerV3(PointModule):
         point = self.embedding(point)
         encoder_output = self.enc(point)
         if not self.cls_mode: 
-            # 保存真正的编码器输出的特征和batch信息
-            # 创建一个新的Point对象来保存编码器输出，避免被解码器修改
             true_encoder_features = encoder_output.feat.clone()
             true_encoder_batch = encoder_output.batch.clone()
             true_encoder_coord = encoder_output.coord.clone()
             
             decoder_output = self.dec(encoder_output)
             
-            # 创建保存编码器输出的结构
             encoder_dict = {
                 'feat': true_encoder_features,
                 'batch': true_encoder_batch, 
@@ -370,66 +367,41 @@ class PointTransformerV3(PointModule):
             return {"encoder_output": true_encoder_output, "decoder_output": decoder_output}
         return encoder_output
 
-# ############################################################### #
-#          Customized Model Wrapper (MillerIndexerV3)             #
-# ############################################################### #
-
-class MillerIndexerV3(nn.Module):
-    """
-    使用 PointTransformerV3 作为骨干网络的 Miller 指数标定模型.
-    这个封装器负责将您项目中的数据格式适配到 PointTransformerV3 所需的格式,
-    并在骨干网络后添加分类头以进行 h, k, l 的预测。
-    新增: 添加了用于预测晶格参数和空间群的头.
-    """
+class XRDT(nn.Module):
     def __init__(self, in_channels=7, num_classes=11, **kwargs):
         super().__init__()
         
-        # 解码器输出通道数，用于Miller指数预测头
         decoder_out_channels = kwargs.get("dec_channels", (64, 128, 256, 512))[0]
         
-        # 编码器输出通道数，用于晶格参数和空间群预测头
-        # 现在我们正确保存了真正的编码器输出，所以可以使用配置的最终维度
         encoder_out_channels = kwargs.get("enc_channels", (64, 128, 256, 512, 1024))[-1]
         
-        # 实例化 PointTransformerV3 骨干网络
         self.backbone = PointTransformerV3(
             in_channels=in_channels,
             cls_mode=False,
             **kwargs
         )
 
-        # --- 任务1: Miller 指数预测头 (逐点，使用解码器输出) ---
         self.cls_h = self._make_head(decoder_out_channels, num_classes)
         self.cls_k = self._make_head(decoder_out_channels, num_classes)
         self.cls_l = self._make_head(decoder_out_channels, num_classes)
         
-        # --- 新增任务: 晶体结构预测头 (逐样本，使用编码器输出) ---
         pooled_feature_dim = encoder_out_channels
         
-        # 任务2: 晶格参数回归头
         self.reg_lattice = nn.Sequential(
             nn.Linear(pooled_feature_dim, 128),
             nn.LayerNorm(128),
             nn.GELU(),
-            nn.Linear(128, 6) # 6个输出: a,b,c,alpha,beta,gamma
+            nn.Linear(128, 6)
         )
         
-        # 任务3: 空间群分类头
         self.cls_space_group = nn.Sequential(
             nn.Linear(pooled_feature_dim, 512),
             nn.LayerNorm(512),
             nn.GELU(),
-            nn.Linear(512, 230) # 230个空间群类别
+            nn.Linear(512, 230)
         )
-        
-        # print(f"MillerIndexerV3 初始化成功。骨干网络: PointTransformerV3, 输入特征维度: {in_channels}")
-        # print(f"  - Miller指数分类数: {num_classes} (使用解码器输出, 通道数: {decoder_out_channels})")
-        # print(f"  - 晶格参数回归头已添加 (6个输出, 使用编码器输出, 通道数: {encoder_out_channels})")
-        # print(f"  - 空间群分类头已添加 (230个输出, 使用编码器输出, 通道数: {encoder_out_channels})")
-
 
     def _make_head(self, in_planes, out_planes):
-        """ 创建一个分类头 """
         return nn.Sequential(
             nn.Linear(in_planes, in_planes // 2), 
             nn.LayerNorm(in_planes // 2), 
@@ -438,38 +410,23 @@ class MillerIndexerV3(nn.Module):
         )
 
     def forward(self, p, x, o):
-        """
-        前向传播函数
-        Args:
-            p (torch.Tensor): 坐标张量 (N, 3)
-            x (torch.Tensor): 特征张量 (N, C_in)
-            o (torch.Tensor): 偏移量张量 (B)
-        """
-        # 1. 构造 PointTransformerV3 所需的输入字典
         data_dict = {"coord": p, "feat": x, "offset": o, "grid_size": 0.01}
         
-        # 2. 通过骨干网络提取编码器和解码器特征
         backbone_out = self.backbone(data_dict)
         encoder_features = backbone_out["encoder_output"].feat # (N, C_enc)
         decoder_features = backbone_out["decoder_output"].feat # (N, C_dec)
         
-        # 3. Miller 指数预测 (逐点，使用解码器特征)
         h = self.cls_h(decoder_features)
         k = self.cls_k(decoder_features)
         l = self.cls_l(decoder_features)
         
-        # 4. 晶体结构预测 (逐样本，使用编码器特征)
-        #    a. 使用编码器输出的batch信息
         encoder_batch = backbone_out["encoder_output"].batch
         
-        #    b. 对每个样本的所有点的编码器特征进行全局平均池化
-        pooled_encoder_features = torch_scatter.scatter_mean(encoder_features, encoder_batch, dim=0) # (B, C_enc)
+        pooled_encoder_features = torch_scatter.scatter_mean(encoder_features, encoder_batch, dim=0)
         
-        #    c. 使用池化后的编码器特征进行预测
         lattice_params = self.reg_lattice(pooled_encoder_features)
         space_group = self.cls_space_group(pooled_encoder_features)
         
-        # 5. 返回所有预测结果
         return {
             'h': h, 
             'k': k, 

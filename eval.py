@@ -9,9 +9,9 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from modelv3 import MillerIndexerV3
-from dataset import MillerDataset, collate_fn_offset
-from loss import CombinedLoss
+from XRDT.model import XRDT
+from XRDT.dataset import MillerDataset, collate_fn_offset
+from XRDT.loss import CombinedLoss
 
 warnings.filterwarnings("ignore")
 
@@ -444,7 +444,7 @@ def main():
     assert in_channels == 4, f"输入特征维度应为4, 但检测到 {in_channels}"
 
     # 创建模型
-    model = MillerIndexerV3(in_channels=in_channels, num_classes=num_classes).cuda()
+    model = XRDT(in_channels=in_channels, num_classes=num_classes).cuda()
     print(f"--> 模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f} M")
     
     # 加载checkpoint

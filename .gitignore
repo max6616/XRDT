@@ -1,2 +1,53 @@
 libs/
 vis/
+pointcept/
+pretrained/
+vis_mask_outputs/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# PyInstaller
+*.spec
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Environment variables
+.env
+.flaskenv
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Test and coverage
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Editor files and temporary files
+.vscode/
+.idea/
+*.swp
+*~
