@@ -3,6 +3,7 @@ vis/
 # pointcept/
 pretrained/
 vis_mask_outputs/
+eval_results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -15,6 +15,9 @@ from XRDT.loss import CombinedLoss
 
 warnings.filterwarnings("ignore")
 
+from cctbx import crystal, miller
+from cctbx.array_family import flex
+
 def get_parser():
     parser = argparse.ArgumentParser(description='High-Performance Point Transformer Evaluation')
     parser.add_argument('--model', type=str, default='pt_v3', help='要使用的模型架构')
@@ -24,7 +27,7 @@ def get_parser():
         # '/media/max/Data/datasets/mp_random_150k_v3_canonical'
         ], help='多个数据集路径，用空格分隔')
     parser.add_argument('--save_path', type=str, default='./eval_results', help='保存评估结果的路径')
-    parser.add_argument('--checkpoint', type=str, default='pretrain/best_model.pth', help='要评估的模型checkpoint路径')
+    parser.add_argument('--checkpoint', type=str, default='pretrained/best_model_v123_angle_limited.pth', help='要评估的模型checkpoint路径')
     parser.add_argument('--batch_size', type=int, default=128, help='批次大小')
     parser.add_argument('--workers', type=int, default=24, help='数据加载的工作进程数')
     parser.add_argument('--min_hkl', type=int, default=-5, help='数据集中hkl的全局最小值 (由分析脚本得到)')
@@ -33,12 +36,14 @@ def get_parser():
     parser.add_argument('--abs_label', type=bool, default=False, help='是否使用绝对值')
     parser.add_argument('--norm_scale', default=True, help='启用坐标缩放归一化')
     parser.add_argument('--debug', type=int, default=0, help='调试模式, 0表示不使用')
-    parser.add_argument('--eval_set', type=str, default='test', choices=['train', 'val', 'test'], help='要评估的数据集')
+    parser.add_argument('--eval_set', type=str, default='val', choices=['train', 'val', 'test'], help='要评估的数据集')
     # 角度范围评估相关
     parser.add_argument('--angle_eval_ranges', nargs='+', type=float, default=[1.0, 0.5, 0.25, 0.1667], help='按比例的角度裁切范围 (1.0=360°, 0.5=180°, 0.1667≈60°, 0.0278≈10°)')
+    # HKL canonicalization control
+    parser.add_argument('--canonicalize_hkl', type=str, default='gt', choices=['none', 'gt', 'pred'], help='是否对预测HKL进行ASU canonicalize，使用gt或pred空间群')
     return parser
 
-def evaluate(loader, model, criterion, save_path=None, eval_set_name='val'):
+def evaluate(loader, model, criterion, save_path=None, eval_set_name='val', canonicalize_hkl='none', miller_index_offset=0):
     model.eval()
     total_loss, h_correct, k_correct, l_correct, all_correct, total_points = 0, 0, 0, 0, 0, 0
     hkl_loss, lattice_loss, sg_loss = 0, 0, 0
@@ -64,6 +69,23 @@ def evaluate(loader, model, criterion, save_path=None, eval_set_name='val'):
         'trigonal': list(range(143, 168)), 'hexagonal': list(range(168, 195)),
         'cubic': list(range(195, 231))
     }
+
+    def _canonicalize_hkl_batch_cctbx(hkl_triplets, sg_number_1_based):
+        """
+        hkl_triplets: List[Tuple[int,int,int]]
+        sg_number_1_based: int in [1,230]
+        returns List[List[int]] same length
+        """
+
+        symm = crystal.symmetry(space_group_symbol=str(int(sg_number_1_based)))
+        ms = miller.set(
+            crystal_symmetry=symm,
+            indices=flex.miller_index(hkl_triplets),
+            anomalous_flag=False
+        )
+        ms_asu = ms.map_to_asu()
+        idx = ms_asu.indices()
+        return [list(idx[i]) for i in range(len(hkl_triplets))]
     
     with torch.no_grad():
         for i, (coords, feats, miller_labels, offsets, crystal_labels, sample_info_list) in enumerate(tqdm(loader, desc='Evaluating')):
@@ -99,6 +121,28 @@ def evaluate(loader, model, criterion, save_path=None, eval_set_name='val'):
                 pred_h = pred_h_all[start_idx:end_idx]
                 pred_k = pred_k_all[start_idx:end_idx]
                 pred_l = pred_l_all[start_idx:end_idx]
+
+                # 可选：对预测HKL执行ASU canonicalize
+                if canonicalize_hkl != 'none':
+                    if canonicalize_hkl == 'gt':
+                        sg = crystal_labels['space_group'][sample_idx].item() + 1
+                    else:  # 'pred'
+                        sg = int(torch.argmax(predictions['space_group'][sample_idx]).item()) + 1
+
+                    # 解码为整数HKL
+                    h_int = (pred_h - miller_index_offset).detach().cpu().numpy().astype(int)
+                    k_int = (pred_k - miller_index_offset).detach().cpu().numpy().astype(int)
+                    l_int = (pred_l - miller_index_offset).detach().cpu().numpy().astype(int)
+                    triplets = list(zip(h_int.tolist(), k_int.tolist(), l_int.tolist()))
+                    # print(sg)
+
+                    canon_triplets = _canonicalize_hkl_batch_cctbx(triplets, sg)
+                    # 重新编码为类别索引
+                    canon_h = torch.tensor([t[0] + miller_index_offset for t in canon_triplets], device=pred_h.device, dtype=pred_h.dtype)
+                    canon_k = torch.tensor([t[1] + miller_index_offset for t in canon_triplets], device=pred_k.device, dtype=pred_k.dtype)
+                    canon_l = torch.tensor([t[2] + miller_index_offset for t in canon_triplets], device=pred_l.device, dtype=pred_l.dtype)
+
+                    pred_h, pred_k, pred_l = canon_h, canon_k, canon_l
                 
                 # 计算该样本的正确数
                 sample_h_correct = (pred_h == labels_h).sum().item()
@@ -471,7 +515,15 @@ def main():
         _, eval_loader = _build_dataset_and_loader(eval_paths, miller_index_offset, args, fixed_clip_fraction=frac)
 
         print(f"--> 开始评估 {args.eval_set} 集，角度范围: {name} ({frac*360:.2f}°)...")
-        eval_metrics, eval_extras = evaluate(eval_loader, model, criterion, subdir, eval_set_name=args.eval_set)
+        eval_metrics, eval_extras = evaluate(
+            eval_loader,
+            model,
+            criterion,
+            subdir,
+            eval_set_name=args.eval_set,
+            canonicalize_hkl=args.canonicalize_hkl,
+            miller_index_offset=miller_index_offset,
+        )
 
         # 打印评估结果
         print("-" * 80)
