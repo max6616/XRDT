@@ -11,12 +11,14 @@ import webbrowser
 from pathlib import Path
 from cctbx import crystal, miller
 from cctbx.array_family import flex
+import csv
+from datetime import datetime
 
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize PointTransformerV3 intermediate outputs and predictions.")
     parser.add_argument("--model", default="pretrained/best_model_v123_angle_limited.pth", help="Path to model checkpoint (.pth)")
-    parser.add_argument("--data", default="/media/max/Data/datasets/mp_random_150k_v3_canonical/test/test_000033.jsonl", help="Path to a jsonl sample file")
+    parser.add_argument("--data", default="/media/max/Data/datasets/mp_random_150k_v3_canonical/test/test_000200.jsonl", help="Path to a jsonl sample file")
     parser.add_argument("--num-classes", type=int, default=11, help="Number of classes")
     parser.add_argument("--in-channels", type=int, default=4, help="Number of input channels")
     parser.add_argument("--device", default=None, help="Device to use (e.g., cuda, cuda:0, cpu). Default: auto")
@@ -172,6 +174,113 @@ def main():
     except Exception as _metrics_exc:
         print(f"Metrics computation failed: {_metrics_exc}")
 
+    # Save per-point CSV and metrics JSONL
+    try:
+        outdir = args.outdir
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+        base_stem = Path(data_file).stem
+
+        # CSV: points with coords, intensity, label hkl, predicted hkl (raw and canonicalized if available)
+        csv_path = os.path.join(outdir, f"{base_stem}_points.csv")
+        points_np = vis_data["p0_original"]
+        intensities_np = vis_data["intensities"]
+        labels_np = vis_data["labels"]
+        preds_raw_np = vis_data.get("predictions_raw", None)
+        preds_canon_np = vis_data.get("predictions_canon", None)
+
+        with open(csv_path, "w", newline="") as f_csv:
+            writer = csv.writer(f_csv)
+            header = [
+                "x",
+                "y",
+                "z",
+                "intensity",
+                "label_h",
+                "label_k",
+                "label_l",
+                "pred_h",
+                "pred_k",
+                "pred_l",
+                "pred_h_canon",
+                "pred_k_canon",
+                "pred_l_canon",
+            ]
+            writer.writerow(header)
+            n = points_np.shape[0]
+            for i in range(n):
+                pr_h = preds_raw_np[i, 0] if preds_raw_np is not None else ""
+                pr_k = preds_raw_np[i, 1] if preds_raw_np is not None else ""
+                pr_l = preds_raw_np[i, 2] if preds_raw_np is not None else ""
+                pc_h = preds_canon_np[i, 0] if preds_canon_np is not None else ""
+                pc_k = preds_canon_np[i, 1] if preds_canon_np is not None else ""
+                pc_l = preds_canon_np[i, 2] if preds_canon_np is not None else ""
+                writer.writerow(
+                    [
+                        float(points_np[i, 0]),
+                        float(points_np[i, 1]),
+                        float(points_np[i, 2]),
+                        float(intensities_np[i]),
+                        int(labels_np[i, 0]),
+                        int(labels_np[i, 1]),
+                        int(labels_np[i, 2]),
+                        pr_h if pr_h == "" else int(pr_h),
+                        pr_k if pr_k == "" else int(pr_k),
+                        pr_l if pr_l == "" else int(pr_l),
+                        pc_h if pc_h == "" else int(pc_h),
+                        pc_k if pc_k == "" else int(pc_k),
+                        pc_l if pc_l == "" else int(pc_l),
+                    ]
+                )
+        print(f"Saved: {os.path.abspath(csv_path)}")
+
+        # JSONL: metrics
+        jsonl_path = os.path.join(outdir, f"{base_stem}_metrics.jsonl")
+        metrics = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "model_path": os.path.abspath(model_path),
+            "data_path": os.path.abspath(data_file),
+            "num_points": int(points_np.shape[0]),
+            "canon_mode": vis_data.get("canon_mode"),
+            "canon_sg_used": vis_data.get("canon_sg_used"),
+            "space_group_gt": vis_data.get("sg_gt"),
+            "space_group_pred": vis_data.get("sg_pred"),
+        }
+
+        # accuracies (as fractions 0-1)
+        try:
+            if preds_raw_np is not None and points_np.shape[0] > 0:
+                metrics.update(
+                    {
+                        "h_accuracy_raw": float((preds_raw_np[:, 0] == labels_np[:, 0]).mean()),
+                        "k_accuracy_raw": float((preds_raw_np[:, 1] == labels_np[:, 1]).mean()),
+                        "l_accuracy_raw": float((preds_raw_np[:, 2] == labels_np[:, 2]).mean()),
+                        "indexing_accuracy_raw": float((np.all(preds_raw_np == labels_np, axis=1)).mean()),
+                    }
+                )
+            if preds_canon_np is not None and points_np.shape[0] > 0:
+                metrics.update(
+                    {
+                        "h_accuracy_canon": float((preds_canon_np[:, 0] == labels_np[:, 0]).mean()),
+                        "k_accuracy_canon": float((preds_canon_np[:, 1] == labels_np[:, 1]).mean()),
+                        "l_accuracy_canon": float((preds_canon_np[:, 2] == labels_np[:, 2]).mean()),
+                        "indexing_accuracy_canon": float((np.all(preds_canon_np == labels_np, axis=1)).mean()),
+                    }
+                )
+        except Exception:
+            pass
+
+        # space group accuracy if available
+        sg_gt = vis_data.get("sg_gt")
+        sg_pred = vis_data.get("sg_pred")
+        if sg_gt is not None and sg_pred is not None:
+            metrics["space_group_accuracy"] = float(1.0 if int(sg_gt) == int(sg_pred) else 0.0)
+
+        with open(jsonl_path, "w") as f_jsl:
+            f_jsl.write(json.dumps(metrics) + "\n")
+        print(f"Saved: {os.path.abspath(jsonl_path)}")
+    except Exception as _save_exc:
+        print(f"Saving CSV/JSONL failed: {_save_exc}")
+
     # Figure 1: Main interactive visualization
     fig = go.Figure()
     add_main_figure(fig, vis_data, is_abs_label=is_abs)
@@ -212,7 +321,7 @@ def main():
                 marker=dict(
                     size=1,
                     color=diff_raw,
-                    colorscale="Reds_r",
+                    colorscale="Reds",
                     cmin=0,
                     cmax=max(1e-6, diff_raw.max()),
                     colorbar=dict(title="HKL L1 Difference"),
@@ -243,9 +352,10 @@ def main():
                 marker=dict(
                     size=1,
                     color=diff_canon,
-                    colorscale="Reds_r",
+                    colorscale="Reds",
                     cmin=0,
                     cmax=max(1e-6, diff_canon.max()),
+                    colorbar=dict(title="HKL L1 Difference"),
                     line=dict(width=0),
                 ),
                 customdata=np.hstack((preds_canon, labels, diff_canon[:, np.newaxis])),
