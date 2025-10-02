@@ -1,16 +1,19 @@
 import os
 import json
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import math
 
 from XRDT.dataset import MillerDataset, collate_fn_offset
 from eval import evaluate as eval_evaluate
 
 
-def log_train_scalars(writer, loss_value, loss_dict, lr, global_step, clip_lower_now=None):
+def log_train_scalars(writer, loss_value, loss_dict, lr, global_step, clip_lower_now=None, angle_range_now=None, density_clip_prob_now=None, noise_adding_prob_now=None):
     writer.add_scalar('Train/Loss_Total', loss_value, global_step)
     writer.add_scalar('Train/Loss_Miller', loss_dict['loss_miller'].detach().item(), global_step)
     writer.add_scalar('Train/Loss_h', loss_dict['loss_h'].detach().item(), global_step)
@@ -21,6 +24,12 @@ def log_train_scalars(writer, loss_value, loss_dict, lr, global_step, clip_lower
     writer.add_scalar('Misc/LR', lr, global_step)
     if clip_lower_now is not None:
         writer.add_scalar('Misc/ClipLowerNow', clip_lower_now, global_step)
+    if angle_range_now is not None:
+        writer.add_scalar('Misc/AngleRange', angle_range_now, global_step)
+    if density_clip_prob_now is not None:
+        writer.add_scalar('Misc/DensityClipProb', density_clip_prob_now, global_step)
+    if noise_adding_prob_now is not None:
+        writer.add_scalar('Misc/NoiseAddingProb', noise_adding_prob_now, global_step)
 
 
 def log_val_metrics(writer, metrics, epoch: int):
@@ -188,7 +197,8 @@ def build_eval_loader(paths, miller_index_offset, args, fixed_clip_fraction=None
 # -------------------------------
 def create_scheduler(optimizer, args, steps_per_epoch: int):
     accum_steps = max(1, int(getattr(args, 'grad_accum_steps', 1)))
-    effective_steps = max(1, steps_per_epoch // accum_steps)
+    # Use ceil to match actual optimizer steps per epoch when the last micro-batch is incomplete
+    effective_steps = max(1, int(math.ceil(steps_per_epoch / float(accum_steps))))
     if args.warmup_epochs > 0:
         return optim.lr_scheduler.OneCycleLR(
             optimizer,

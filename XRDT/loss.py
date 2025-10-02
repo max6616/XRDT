@@ -30,17 +30,34 @@ class CombinedLoss(nn.Module):
             return focal_loss.mean()
         return focal_loss
 
-    def forward(self, predictions, miller_targets, crystal_targets, offsets):
+    def forward(self, predictions, miller_targets, crystal_targets, offsets, point_loss_mask=None):
         device = predictions['h'].device
         # 期望 miller_targets 为 [N, 3]
         targets_h = miller_targets[:, 0]
         targets_k = miller_targets[:, 1]
         targets_l = miller_targets[:, 2]
 
-        # Miller 分类损失
-        loss_h = self.focal_loss(predictions['h'], targets_h)
-        loss_k = self.focal_loss(predictions['k'], targets_k)
-        loss_l = self.focal_loss(predictions['l'], targets_l)
+        # Miller 分类损失（支持可选逐点mask，屏蔽不计入损失的点）
+        if point_loss_mask is not None:
+            mask = point_loss_mask.to(device=device, dtype=torch.bool)
+            # reduction='none' 计算逐点损失，再进行掩码平均
+            loss_h_vec = self.focal_loss(predictions['h'], targets_h, reduction='none')
+            loss_k_vec = self.focal_loss(predictions['k'], targets_k, reduction='none')
+            loss_l_vec = self.focal_loss(predictions['l'], targets_l, reduction='none')
+
+            def masked_mean(vec, m):
+                if torch.any(m):
+                    return vec[m].mean()
+                # 若全被屏蔽，返回0且保持梯度图正常
+                return torch.tensor(0.0, device=device, dtype=vec.dtype)
+
+            loss_h = masked_mean(loss_h_vec, mask)
+            loss_k = masked_mean(loss_k_vec, mask)
+            loss_l = masked_mean(loss_l_vec, mask)
+        else:
+            loss_h = self.focal_loss(predictions['h'], targets_h)
+            loss_k = self.focal_loss(predictions['k'], targets_k)
+            loss_l = self.focal_loss(predictions['l'], targets_l)
         miller_loss = loss_h + loss_k + loss_l
         loss_h_item = loss_h.item()
         loss_k_item = loss_k.item()

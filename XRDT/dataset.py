@@ -10,7 +10,7 @@ from torch.utils.data import IterableDataset, DataLoader
 
 class MillerDataset(IterableDataset):
     def __init__(self, paths, miller_index_offset, augment_angle=False, augment_scale=False, 
-                 scale_range=(0.9, 1.1), max_points=1e8, debug=0, abs_label=False, norm_scale=False, fixed_clip_fraction=None):
+                 scale_range=(0.9, 1.1), max_points=8192, debug=0, abs_label=False, norm_scale=False, fixed_clip_fraction=None, fixed_density_divisor=None):
         super(MillerDataset, self).__init__()
         
         # Support single path or list of paths
@@ -47,6 +47,7 @@ class MillerDataset(IterableDataset):
         self.abs_label = abs_label
         self.norm_scale = norm_scale
         self.fixed_clip_fraction = fixed_clip_fraction
+        self.fixed_density_divisor = fixed_density_divisor
         
         print(f"--> Total files loaded: {len(self.files)}")
         if self.norm_scale:
@@ -89,6 +90,16 @@ class MillerDataset(IterableDataset):
                 return torch.tensor(points, dtype=torch.float), torch.ones(len(points), dtype=torch.bool)
             return points_tensor, mask, labels_tensor
         
+        # Deterministic uniform angular downsampling by divisor (keep every k-th by sorted angle)
+        if self.fixed_density_divisor is not None and int(self.fixed_density_divisor) > 1:
+            k = int(self.fixed_density_divisor)
+            order = torch.argsort(points_tensor[:, 0])
+            kept = order[::k]
+            if kept.numel() == 0:
+                kept = order[:1]
+            points_tensor = points_tensor[kept]
+            labels_tensor = labels_tensor[kept]
+
         return points_tensor, original_mask, labels_tensor
         
     def __iter__(self):
@@ -99,56 +110,53 @@ class MillerDataset(IterableDataset):
         for f_path in files_to_process:
             filename = os.path.basename(f_path)
             with open(f_path, 'r') as f:
-                for line_idx, line in enumerate(f):
-                    try:
-                        data = json.loads(line)
-                        assert len(data['input_sequence']) == len(data['labels']), f"input_sequence: {len(data['input_sequence'])}, labels: {len(data['labels'])}"
-                        # INSERT_YOUR_CODE
-                        if 'metadata' in data and 'crystal_params' in data['metadata']:
-                            data['metadata']['crystal_params'].pop('_symmetry_space_group_name_H-M', None)
-                        assert len(data['metadata']['crystal_params'].values()) == 7, f"metadata: {data['metadata']}"
+                line = f.readline()
+                data = json.loads(line)
+                assert len(data['input_sequence']) == len(data['labels']), f"input_sequence: {len(data['input_sequence'])}, labels: {len(data['labels'])}"
+                # INSERT_YOUR_CODE
+                if 'metadata' in data and 'crystal_params' in data['metadata']:
+                    data['metadata']['crystal_params'].pop('_symmetry_space_group_name_H-M', None)
+                assert len(data['metadata']['crystal_params'].values()) == 7, f"metadata: {data['metadata']}"
 
-                        points, aug_mask, labels_raw = self._apply_augmentations(data['input_sequence'], data['labels'])
-                        
-                        if labels_raw.ndim == 2:
-                            # [N, 3] -> 单标签
-                            labels = labels_raw
-                        else:
-                            # [H, N, 3] -> 仅取第一个假设
-                            labels = labels_raw[0]
-                        if self.augment_scale: labels = labels[aug_mask]
-                        num_points = points.shape[0]
-                        if num_points == 0: continue
-                        
-                        crystal_params_raw = data.get('metadata', {}).get('crystal_params', None)
-                        if crystal_params_raw:
-                            lengths = torch.tensor([float(p) for p in crystal_params_raw.values()][:3]) / 10.0
-                            angles = torch.tensor([float(p) for p in crystal_params_raw.values()][3:6]) / 180.0
-                            lattice_labels = torch.cat([lengths, angles])
-                            sg_label = torch.tensor([int(crystal_params_raw['_symmetry_Int_Tables_number']) - 1], dtype=torch.long)
-                            crystal_labels = {'lattice': lattice_labels, 'space_group': sg_label}
-                        else:
-                            crystal_labels = {'lattice': torch.zeros(6), 'space_group': torch.tensor([-1], dtype=torch.long)}
+                points, aug_mask, labels_raw = self._apply_augmentations(data['input_sequence'], data['labels'])
+                
+                if labels_raw.ndim == 2:
+                    # [N, 3] -> 单标签
+                    labels = labels_raw
+                else:
+                    # [H, N, 3] -> 仅取第一个假设
+                    labels = labels_raw[0]
+                if self.augment_scale: labels = labels[aug_mask]
+                num_points = points.shape[0]
+                if num_points == 0: continue
+                
+                crystal_params_raw = data.get('metadata', {}).get('crystal_params', None)
+                if crystal_params_raw:
+                    lengths = torch.tensor([float(p) for p in crystal_params_raw.values()][:3]) / 10.0
+                    angles = torch.tensor([float(p) for p in crystal_params_raw.values()][3:6]) / 180.0
+                    lattice_labels = torch.cat([lengths, angles])
+                    sg_label = torch.tensor([int(crystal_params_raw['_symmetry_Int_Tables_number']) - 1], dtype=torch.long)
+                    crystal_labels = {'lattice': lattice_labels, 'space_group': sg_label}
+                else:
+                    crystal_labels = {'lattice': torch.zeros(6), 'space_group': torch.tensor([-1], dtype=torch.long)}
 
-                        points[:, 3] = points[:, 3] / 10.0
-                        if points.shape[0] > self.max_points:
-                            points = points[:self.max_points]
-                            labels = labels[:self.max_points, :]
-                        
-                        if self.abs_label:
-                            labels = torch.abs(labels)
-                        else:
-                            labels += self.miller_index_offset
+                points[:, 3] = points[:, 3] / 10.0
+                if points.shape[0] > self.max_points:
+                    points = points[:self.max_points]
+                    labels = labels[:self.max_points, :]
+                
+                if self.abs_label:
+                    labels = torch.abs(labels)
+                else:
+                    labels += self.miller_index_offset
 
-                        # Sample info
-                        sample_info = {
-                            'filename': filename,
-                            'source_path': f_path,
-                        }
-                        yield points, labels, crystal_labels, sample_info
-                    except Exception as e:
-                        print(f"Skipping line in {f_path}: {e}")
-                        continue
+                # Sample info
+                sample_info = {
+                    'filename': filename,
+                    'source_path': f_path,
+                }
+                yield points, labels, crystal_labels, sample_info
+
 
 def collate_fn_offset(batch):
     points_list, labels_list, crystal_labels_list, sample_info_list = zip(*batch)
