@@ -1,6 +1,6 @@
 # RCT
 
-This repo is the official project repository of the paper ***Rapid Structure-agnostic Single Crystal X-Ray Diffraction Indexing via Reflection Cloud Learning*** [ [arxiv](https://) ]
+This repo is the official project repository of the paper ***Rapid Structure-agnostic Single Crystal X-Ray Diffraction Indexing via Reflection Cloud Learning*** [ [arxiv](https://) ] [ [RC-400K](https://) ]
 
 Authors: 
 
@@ -11,7 +11,7 @@ Prerequisites [[uv](https://astral.sh/uv/)] [[mamba](https://mamba.readthedocs.i
 
 ### Simulator Environment
 
-We build our simulator based on [DATAD(https://datad.netlify.app/)]. Please first apply for datad.whl file at [here(https://datad.netlify.app/install)].
+We build our simulator based on [DATAD](https://datad.netlify.app/). Please first apply for datad.whl file at [here](https://datad.netlify.app/install).
 
 ```bash
 
@@ -49,8 +49,8 @@ cd ../..
 
 ## Links
 
-We use [DATAD(https://datad.netlify.app/)] as our XRD simulator.
-RCT is based on [PointTransformerV3(https://github.com/Pointcept/PointTransformerV3)], 并从[pointcept(https://github.com/Pointcept/Pointcept)]中借鉴了相关实现。
+We use [DATAD](https://datad.netlify.app/) as our XRD simulator.
+RCT is based on [PointTransformerV3](https://github.com/Pointcept/PointTransformerV3), 并从[pointcept](https://github.com/Pointcept/Pointcept)中借鉴了相关实现。
 
 
 ## Bibtex
