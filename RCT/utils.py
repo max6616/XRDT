@@ -5,11 +5,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import torch
+import contextlib
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import math
 
-from XRDT.dataset import MillerDataset, collate_fn_offset
+from RCT.dataset import MillerDataset, collate_fn_offset
 from eval import evaluate as eval_evaluate
 
 
@@ -87,6 +87,11 @@ def draw_overlay_plots(ordered_items, full_root, eval_set_name='val'):
     ax1.legend(); ax2.legend()
     plt.tight_layout()
     plt.savefig(overlay_lattice_path, dpi=300, bbox_inches='tight')
+    try:
+        base, _ = os.path.splitext(overlay_lattice_path)
+        plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+    except Exception:
+        pass
     plt.close()
 
     angle_names = [name for name, _, __, ___ in ordered_items]
@@ -128,6 +133,11 @@ def draw_overlay_plots(ordered_items, full_root, eval_set_name='val'):
         plt.legend(legend_handles, angle_names, loc='upper right')
         plt.tight_layout()
         plt.savefig(overlay_acc_paths[key], dpi=300, bbox_inches='tight')
+        try:
+            base, _ = os.path.splitext(overlay_acc_paths[key])
+            plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+        except Exception:
+            pass
         plt.close()
 
 
@@ -147,7 +157,10 @@ def build_datasets(train_paths, val_paths, miller_index_offset, args):
         augment_angle=args.augment_angle,
         augment_scale=False,
         debug=args.debug,
-        norm_scale=args.norm_scale
+        norm_scale=args.norm_scale,
+        lattice_stats_json=getattr(args, 'lattice_stats_json', None),
+        intensity_mean=getattr(args, 'intensity_mean', None),
+        intensity_std=getattr(args, 'intensity_std', None)
     )
     val_dataset = MillerDataset(
         paths=val_paths,
@@ -155,7 +168,10 @@ def build_datasets(train_paths, val_paths, miller_index_offset, args):
         augment_angle=False,
         augment_scale=False,
         debug=0,
-        norm_scale=args.norm_scale
+        norm_scale=args.norm_scale,
+        lattice_stats_json=getattr(args, 'lattice_stats_json', None),
+        intensity_mean=getattr(args, 'intensity_mean', None),
+        intensity_std=getattr(args, 'intensity_std', None)
     )
     return train_dataset, val_dataset
 
@@ -179,7 +195,10 @@ def build_eval_loader(paths, miller_index_offset, args, fixed_clip_fraction=None
         augment_scale=False,
         debug=0,
         norm_scale=args.norm_scale,
-        fixed_clip_fraction=fixed_clip_fraction
+        fixed_clip_fraction=fixed_clip_fraction,
+        lattice_stats_json=getattr(args, 'lattice_stats_json', None),
+        intensity_mean=getattr(args, 'intensity_mean', None),
+        intensity_std=getattr(args, 'intensity_std', None)
     )
     loader = DataLoader(
         dataset,
@@ -196,15 +215,12 @@ def build_eval_loader(paths, miller_index_offset, args, fixed_clip_fraction=None
 # Scheduler helpers
 # -------------------------------
 def create_scheduler(optimizer, args, steps_per_epoch: int):
-    accum_steps = max(1, int(getattr(args, 'grad_accum_steps', 1)))
-    # Use ceil to match actual optimizer steps per epoch when the last micro-batch is incomplete
-    effective_steps = max(1, int(math.ceil(steps_per_epoch / float(accum_steps))))
     if args.warmup_epochs > 0:
         return optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=args.lr,
             epochs=args.epochs,
-            steps_per_epoch=effective_steps,
+            steps_per_epoch=steps_per_epoch,
             pct_start=args.warmup_epochs / args.epochs,
             anneal_strategy=args.warmup_method,
         )
@@ -216,9 +232,13 @@ def create_scheduler(optimizer, args, steps_per_epoch: int):
 # -------------------------------
 def run_fast_eval(val_paths, miller_index_offset, args, model, criterion):
     _, val_loader_simple = build_eval_loader(val_paths, miller_index_offset, args, fixed_clip_fraction=None)
-    val_metrics, _ = eval_evaluate(val_loader_simple, model, criterion, save_path=None, eval_set_name='val')
+    val_metrics, _ = eval_evaluate(val_loader_simple, model, criterion, save_path=None, eval_set_name='val', noise_prob=0.0, noise_micro=0.001)
     del val_loader_simple
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
     return val_metrics
 
 
@@ -235,7 +255,11 @@ def run_full_eval(val_paths, miller_index_offset, args, model, criterion, save_r
         with open(os.path.join(subdir, 'val_evaluation_results.json'), 'w', encoding='utf-8') as f:
             json.dump({k: (v.item() if hasattr(v, 'item') else v) for k, v in metrics.items()}, f, indent=2, ensure_ascii=False)
         del vloader
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
     draw_overlay_plots(ordered_items, save_root, eval_set_name='val')
 
 

@@ -4,6 +4,7 @@ vis/
 pretrained/
 vis_mask_outputs/
 eval_results/
+tools/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

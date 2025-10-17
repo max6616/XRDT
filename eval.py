@@ -11,11 +11,12 @@ import seaborn as sns
 import pandas as pd
 from tqdm import tqdm
 import torch
+import contextlib
 from torch.utils.data import DataLoader
 
-from XRDT.model import XRDT
-from XRDT.dataset import MillerDataset, collate_fn_offset
-from XRDT.loss import CombinedLoss
+from RCT.model import RCT
+from RCT.dataset import MillerDataset, collate_fn_offset
+from RCT.loss import CombinedLoss
 
 warnings.filterwarnings("ignore")
 
@@ -27,34 +28,35 @@ def get_parser():
     parser = argparse.ArgumentParser(description='High-Performance Point Transformer Evaluation')
     parser.add_argument('--model', type=str, default='pt_v3', help='Model architecture to use')
     parser.add_argument('--data_paths', nargs='+', default=[
-        '/media/max/Data/datasets/mp_random_150k_v1_canonical', 
-        '/media/max/Data/datasets/mp_random_150k_v2_canonical',
-        '/media/max/Data/datasets/mp_random_150k_v3_canonical'
-        ], help='Multiple dataset paths, separated by spaces')
+                                                            '/media/max/Data/datasets/mp_random_150k_v1_canonical', 
+                                                            '/media/max/Data/datasets/mp_random_150k_v2_canonical',
+                                                            '/media/max/Data/datasets/mp_random_150k_v3_canonical'
+                                                            ], help='Multiple dataset paths, separated by spaces')
     parser.add_argument('--save_path', type=str, default='./eval_results', help='Path to save evaluation results')
-    parser.add_argument('--checkpoint', type=str, default='/media/max/Data/results/xrd_transformer/v1-3_canonical_ang_clip_density_clip_noise/XRDT_20251002_170401/best_model.pth', help='Model checkpoint path to evaluate')
+    parser.add_argument('--checkpoint', type=str, default='pretrained/best_model_v123_angle_limited.pth', help='Model checkpoint path to evaluate')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--workers', type=int, default=32, help='Number of worker processes for data loading')
     parser.add_argument('--min_hkl', type=int, default=-5, help='Global minimum value of hkl in dataset (obtained from analysis script)')
     parser.add_argument('--max_hkl', type=int, default=5, help='Global maximum value of hkl in dataset (obtained from analysis script)')
-    # Single label evaluation mode, no multi-hypothesis parameters needed
     parser.add_argument('--abs_label', type=bool, default=False, help='Whether to use absolute values')
     parser.add_argument('--norm_scale', default=True, help='Enable coordinate scaling normalization')
     parser.add_argument('--debug', type=int, default=0, help='Debug mode, 0 means disabled')
     parser.add_argument('--eval_set', type=str, default='val', choices=['train', 'val', 'test'], help='Dataset to evaluate')
-    # Angle range evaluation related
-    parser.add_argument('--angle_eval_ranges', nargs='+', type=float, default=[1.0, 0.5, 0.25, 0.16667, 0.08334, 0.02778], help='Proportional angle clipping ranges (1.0=360°, 0.5=180°, 0.1667≈60°, 0.0278≈10°)')
-    # HKL canonicalization control
     parser.add_argument('--canonicalize_hkl', type=str, default='none', choices=['none', 'gt', 'pred'], help='Whether to perform ASU canonicalization on predicted HKL, using gt or pred space group')
-    # Density sensitivity evaluation on full-angle data
+    parser.add_argument('--angle_eval_ranges', nargs='+', type=float, default=[1.0, 0.5, 0.25, 0.16667, 0.08334, 0.02778], help='Proportional angle clipping ranges (1.0=360°, 0.5=180°, 0.1667≈60°, 0.0278≈10°)')
     parser.add_argument('--density_eval_ranges', nargs='+', type=int, default=[1, 2, 3, 4, 5, 6], help='Uniform angular downsampling divisors, e.g., 2 4 8 -> 1/2, 1/4, 1/8')
     # Noisy evaluation (training-like perturbations during eval)
     parser.add_argument('--noisy_eval_enable', type=bool, default=True, help='Run an extra evaluation with noise perturbation')
     parser.add_argument('--noise_eval_prob', type=float, default=0.05, help='Probability of turning a point into full random noise (ignored in loss/metrics)')
-    parser.add_argument('--noise_eval_micro', type=float, default=0.01, help='Max micro perturbation on XY (in [0,1] range)')
+    parser.add_argument('--noise_eval_micro', type=float, default=0.001, help='Max micro perturbation on XY (in [0,1] range)')
+    parser.add_argument('--lattice_stats_json', type=str, default='cell_params_statistics.json', help='Path to lattice stats JSON produced by analyze_cif_cell_lengths.py (summary_cell_params.json)')
+    # intensity standardization
+    parser.add_argument('--intensity_mean', type=float, default=7.029995, help='Mean of intensity for standardization; if set with std, use (I-mean)/std')
+    parser.add_argument('--intensity_std', type=float, default=4.295749, help='Std of intensity for standardization; must be > 0')
     return parser
 
-def evaluate(loader, model, criterion, save_path=None, eval_set_name='val', canonicalize_hkl='none', miller_index_offset=0, apply_noise=False, noise_prob=0.0, noise_micro=0.01):
+def evaluate(loader, model, criterion, save_path=None, eval_set_name='val', canonicalize_hkl='none', miller_index_offset=0, 
+            apply_noise=False, noise_prob=0.0, noise_micro=0.001):
     model.eval()
     total_loss, h_correct, k_correct, l_correct, all_correct, total_points = 0, 0, 0, 0, 0, 0
     hkl_loss, lattice_loss, sg_loss = 0, 0, 0
@@ -123,6 +125,9 @@ def evaluate(loader, model, criterion, save_path=None, eval_set_name='val', cano
         return coords, feats, loss_mask
 
     with torch.no_grad():
+        device = next(model.parameters()).device
+        use_cuda = (device.type == 'cuda')
+        non_blocking = use_cuda
         try:
             total_samples_for_pbar = len(loader.dataset)
         except Exception:
@@ -130,13 +135,22 @@ def evaluate(loader, model, criterion, save_path=None, eval_set_name='val', cano
 
         pbar = tqdm(total=total_samples_for_pbar, desc='Evaluating', unit='samples', dynamic_ncols=True)
         for i, (coords, feats, miller_labels, offsets, crystal_labels, sample_info_list) in enumerate(loader):
-            coords, feats, miller_labels, offsets = coords.cuda(non_blocking=True), feats.cuda(non_blocking=True), miller_labels.cuda(non_blocking=True), offsets.cuda(non_blocking=True)
-            crystal_labels = {k: v.cuda(non_blocking=True) for k, v in crystal_labels.items()}
+            coords = coords.to(device, non_blocking=non_blocking)
+            feats = feats.to(device, non_blocking=non_blocking)
+            miller_labels = miller_labels.to(device, non_blocking=non_blocking)
+            offsets = offsets.to(device, non_blocking=non_blocking)
+            crystal_labels = {k: v.to(device, non_blocking=non_blocking) for k, v in crystal_labels.items()}
 
+            # Always add micro XY perturbation; only add full random noise points when apply_noise and noise_prob > 0
             point_loss_mask = None
-            if apply_noise:
-                coords, feats, point_loss_mask = _apply_noise_adding_batch(coords, feats, offsets, micro_noise_max=noise_micro, prob_noisify=noise_prob)
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            noisify_prob = float(noise_prob) if (apply_noise and float(noise_prob) > 0.0) else 0.0
+            coords, feats, _loss_mask = _apply_noise_adding_batch(
+                coords, feats, offsets, micro_noise_max=float(noise_micro), prob_noisify=noisify_prob
+            )
+            if noisify_prob > 0.0:
+                point_loss_mask = _loss_mask
+            amp_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.float16) if use_cuda else contextlib.nullcontext()
+            with amp_ctx:
                 predictions = model(coords, feats, offsets)
                 loss_dict = criterion(predictions, miller_labels, crystal_labels, offsets, point_loss_mask=point_loss_mask)
             
@@ -149,7 +163,7 @@ def evaluate(loader, model, criterion, save_path=None, eval_set_name='val', cano
             pred_h_all = torch.argmax(predictions['h'], dim=1)
             pred_k_all = torch.argmax(predictions['k'], dim=1)
             pred_l_all = torch.argmax(predictions['l'], dim=1)
-            if apply_noise and point_loss_mask is not None:
+            if point_loss_mask is not None:
                 mask_all = point_loss_mask
             else:
                 mask_all = torch.ones_like(pred_h_all, dtype=torch.bool, device=pred_h_all.device)
@@ -267,9 +281,21 @@ def evaluate(loader, model, criterion, save_path=None, eval_set_name='val', cano
             if num_valid_samples > 0:
                 pred_lattice = predictions['lattice_params'][valid_crystal_mask]
                 target_lattice = crystal_labels['lattice'][valid_crystal_mask]
-                pred_lattice_unnorm = pred_lattice.clone(); target_lattice_unnorm = target_lattice.clone()
-                pred_lattice_unnorm[:, :3] *= 10; target_lattice_unnorm[:, :3] *= 10
-                pred_lattice_unnorm[:, 3:] *= 180; target_lattice_unnorm[:, 3:] *= 180
+                # De-standardize using dataset stats if available; fallback to coarse scaling
+                try:
+                    lm = getattr(loader.dataset, 'lattice_mean', None)
+                    ls = getattr(loader.dataset, 'lattice_std', None)
+                except Exception:
+                    print("Warning: failed to load lattice stats from dataset")
+                    lm, ls = None, None
+                if lm is None or ls is None:
+                    lm = torch.zeros(6, device=pred_lattice.device, dtype=pred_lattice.dtype)
+                    ls = torch.tensor([10.0, 10.0, 10.0, 180.0, 180.0, 180.0], device=pred_lattice.device, dtype=pred_lattice.dtype)
+                else:
+                    lm = lm.to(device=pred_lattice.device, dtype=pred_lattice.dtype)
+                    ls = ls.to(device=pred_lattice.device, dtype=pred_lattice.dtype)
+                pred_lattice_unnorm = pred_lattice * ls + lm
+                target_lattice_unnorm = target_lattice * ls + lm
                 
                 # Calculate absolute errors for abc and angles
                 abc_errors = torch.abs(pred_lattice_unnorm[:, :3] - target_lattice_unnorm[:, :3])
@@ -424,9 +450,15 @@ def plot_accuracy_by_sg(stats_by_sg, crystal_systems, save_path, eval_set_name, 
     # Ensure save directory exists
     os.makedirs(save_path, exist_ok=True)
     
-    # Save plot
+    # Save plot (PNG + EPS)
     filename = f'{eval_set_name}_accuracy_{acc_type}_by_sg.png'
-    plt.savefig(os.path.join(save_path, filename), dpi=300, bbox_inches='tight')
+    out_png = os.path.join(save_path, filename)
+    plt.savefig(out_png, dpi=300, bbox_inches='tight')
+    try:
+        base, _ = os.path.splitext(out_png)
+        plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+    except Exception:
+        pass
     plt.close()
 
 def plot_lattice_cumulative_distribution(abc_errors, ang_errors, save_path, eval_set_name):
@@ -504,9 +536,15 @@ def plot_lattice_cumulative_distribution(abc_errors, ang_errors, save_path, eval
     eval_results_path = save_path
     os.makedirs(eval_results_path, exist_ok=True)
     
-    # Save figure
+    # Save figure (PNG + EPS)
     filename = f'{eval_set_name}_lattice_cumulative_distribution.png'
-    plt.savefig(os.path.join(eval_results_path, filename), dpi=300, bbox_inches='tight')
+    out_png = os.path.join(eval_results_path, filename)
+    plt.savefig(out_png, dpi=300, bbox_inches='tight')
+    try:
+        base, _ = os.path.splitext(out_png)
+        plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+    except Exception:
+        pass
     plt.close()
     
     print(f"[{eval_set_name.upper()}] Lattice cumulative distribution charts saved to: {filename}")
@@ -599,7 +637,13 @@ def plot_violin_accuracy_by_sg(accs_by_sg, crystal_systems, save_path, eval_set_
 
     os.makedirs(save_path, exist_ok=True)
     filename = f'{eval_set_name}_accuracy_{acc_type}_by_sg.png'
-    plt.savefig(os.path.join(save_path, filename), dpi=300, bbox_inches='tight')
+    out_png = os.path.join(save_path, filename)
+    plt.savefig(out_png, dpi=300, bbox_inches='tight')
+    try:
+        base, _ = os.path.splitext(out_png)
+        plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+    except Exception:
+        pass
     plt.close()
 
 def plot_summary_accuracy_by_sg(accs_by_sg, crystal_systems, save_path, eval_set_name, acc_type):
@@ -739,7 +783,13 @@ def plot_violin_accuracy_all_by_cs(accs_all_by_sg, crystal_systems, save_path, e
     plt.tight_layout()
     os.makedirs(save_path, exist_ok=True)
     filename = f'{eval_set_name}_accuracy_all_by_cs.png'
-    plt.savefig(os.path.join(save_path, filename), dpi=300, bbox_inches='tight')
+    out_png = os.path.join(save_path, filename)
+    plt.savefig(out_png, dpi=300, bbox_inches='tight')
+    try:
+        base, _ = os.path.splitext(out_png)
+        plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+    except Exception:
+        pass
     plt.close()
 
 def plot_3d_violin_accuracy_all_by_cs_across_angles(root_save_dir, angle_ranges, angle_name_map, eval_set_name, crystal_systems):
@@ -838,6 +888,11 @@ def plot_3d_violin_accuracy_all_by_cs_across_angles(root_save_dir, angle_ranges,
     plt.tight_layout()
     out_path = os.path.join(root_save_dir, f'{eval_set_name}_accuracy_all_by_cs_3d.png')
     plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    try:
+        base, _ = os.path.splitext(out_path)
+        plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+    except Exception:
+        pass
     plt.close()
 
 def plot_bars_accuracy_all_by_cs_across_angles(root_save_dir, angle_ranges, angle_name_map, eval_set_name, crystal_systems):
@@ -900,6 +955,11 @@ def plot_bars_accuracy_all_by_cs_across_angles(root_save_dir, angle_ranges, angl
     plt.tight_layout()
     out_path = os.path.join(root_save_dir, f'{eval_set_name}_accuracy_all_by_cs_bars.png')
     plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    try:
+        base, _ = os.path.splitext(out_path)
+        plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+    except Exception:
+        pass
     plt.close()
 
 def plot_violins_accuracy_all_by_cs_across_angles(root_save_dir, angle_ranges, angle_name_map, eval_set_name, crystal_systems):
@@ -989,6 +1049,11 @@ def plot_violins_accuracy_all_by_cs_across_angles(root_save_dir, angle_ranges, a
     plt.tight_layout()
     out_path = os.path.join(root_save_dir, f'{eval_set_name}_accuracy_all_by_cs_violins_by_angle.png')
     plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    try:
+        base, _ = os.path.splitext(out_path)
+        plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+    except Exception:
+        pass
     plt.close()
 
 def _build_dataset_and_loader(eval_paths, miller_index_offset, args, fixed_clip_fraction=None, fixed_density_divisor=None):
@@ -1001,7 +1066,10 @@ def _build_dataset_and_loader(eval_paths, miller_index_offset, args, fixed_clip_
         abs_label=args.abs_label,
         norm_scale=args.norm_scale,
         fixed_clip_fraction=fixed_clip_fraction,
-        fixed_density_divisor=fixed_density_divisor
+        fixed_density_divisor=fixed_density_divisor,
+        lattice_stats_json=getattr(args, 'lattice_stats_json', None),
+        intensity_mean=getattr(args, 'intensity_mean', None),
+        intensity_std=getattr(args, 'intensity_std', None)
     )
     eval_loader = DataLoader(
         eval_dataset,
@@ -1054,7 +1122,9 @@ def main():
     assert in_channels == 4, f"Input feature dimensions should be 4, but detected {in_channels}"
 
     # Create model
-    model = XRDT(in_channels=in_channels, num_classes=num_classes).cuda()
+    # create model on CUDA if available; fall back to CPU
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = RCT(in_channels=in_channels, num_classes=num_classes).to(device)
     print(f"--> Model parameter count: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f} M")
     
     # Load checkpoint
@@ -1064,82 +1134,70 @@ def main():
     print("--> Model parameters loaded successfully")
     
     # Create loss function
-    criterion = CombinedLoss(miller_weight=1.0, lattice_weight=5.0, sg_weight=0.2).cuda()
+    criterion = CombinedLoss(miller_weight=1.0, lattice_weight=5.0, sg_weight=0.2).to(device)
     
-    # Loop through different angle range evaluations
-    angle_ranges = args.angle_eval_ranges
+    # Evaluation order:
+    # 1) Full baseline (micro XY perturbation, no random noise points)
     summary_results = {}
     angle_name_map = {}
-    for frac in angle_ranges:
-        name = f'{int(frac*360)}deg'
 
-        angle_name_map[frac] = name
-        subdir = os.path.join(root_save_dir, name)
-        os.makedirs(subdir, exist_ok=True)
+    baseline_name = '360deg'
+    baseline_subdir = os.path.join(root_save_dir, baseline_name)
+    os.makedirs(baseline_subdir, exist_ok=True)
+    _, baseline_loader = _build_dataset_and_loader(eval_paths, miller_index_offset, args, fixed_clip_fraction=1.0, fixed_density_divisor=None)
+    print(f"--> Starting BASELINE evaluation of {args.eval_set} set (360deg, micro-only)...")
+    baseline_metrics, baseline_extras = evaluate(
+        baseline_loader,
+        model,
+        criterion,
+        baseline_subdir,
+        eval_set_name=args.eval_set,
+        canonicalize_hkl=args.canonicalize_hkl,
+        miller_index_offset=miller_index_offset,
+        apply_noise=False,  # micro-only applied inside evaluate
+        noise_prob=0.0,
+        noise_micro=float(getattr(args, 'noise_eval_micro', 0.001)),
+    )
+    print("-" * 80)
+    print(f"Evaluation Results ({args.eval_set.upper()} Set, {baseline_name}):")
+    print(f"  Loss: {baseline_metrics['loss']:.4f}")
+    print(f"  L_miller: {baseline_metrics['loss_miller']:.4f}")
+    print(f"  L_lattice: {baseline_metrics['loss_lattice']:.4f}")
+    print(f"  L_sg: {baseline_metrics['loss_sg']:.4f}")
+    print(f"  Miller Acc: {baseline_metrics['acc_all']:.2f}%")
+    print(f"  H Acc: {baseline_metrics['acc_h']:.2f}%")
+    print(f"  K Acc: {baseline_metrics['acc_k']:.2f}%")
+    print(f"  L Acc: {baseline_metrics['acc_l']:.2f}%")
+    print(f"  SG Acc: {baseline_metrics['sg_acc']:.2f}%")
+    print(f"  Lattice MAE A: {baseline_metrics['lattice_mae_a']:.4f}")
+    print(f"  Lattice MAE Ang: {baseline_metrics['lattice_mae_ang']:.4f}")
+    print("-" * 80)
+    # Save baseline results JSON
+    baseline_results_path = os.path.join(baseline_subdir, f'{args.eval_set}_evaluation_results.json')
+    with open(baseline_results_path, 'w', encoding='utf-8') as f:
+        json.dump({k: (v.item() if hasattr(v, 'item') else v) for k, v in baseline_metrics.items()}, f, indent=2, ensure_ascii=False)
+    summary_results[baseline_name] = {k: (v.item() if hasattr(v, 'item') else v) for k, v in baseline_metrics.items()}
+    # Save extras for overlays
+    with open(os.path.join(baseline_subdir, f'{args.eval_set}_extras.npy'), 'wb') as f:
+        np.save(f, {
+            'abc_errors': np.array(baseline_extras.get('abc_errors', []), dtype=np.float32),
+            'ang_errors': np.array(baseline_extras.get('ang_errors', []), dtype=np.float32),
+        }, allow_pickle=True)
+    stats_json = {str(k): {kk: int(vv) for kk, vv in v.items()} for k, v in baseline_extras.get('stats_by_sg', {}).items()}
+    with open(os.path.join(baseline_subdir, f'{args.eval_set}_stats_by_sg.json'), 'w', encoding='utf-8') as f:
+        json.dump(stats_json, f, indent=2, ensure_ascii=False)
+    del baseline_loader
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
-        # Build data loader for this angle
-        _, eval_loader = _build_dataset_and_loader(eval_paths, miller_index_offset, args, fixed_clip_fraction=frac, fixed_density_divisor=None)
-
-        print(f"--> Starting evaluation of {args.eval_set} set, angle range: {name} ({frac*360:.2f}°)...")
-        eval_metrics, eval_extras = evaluate(
-            eval_loader,
-            model,
-            criterion,
-            subdir,
-            eval_set_name=args.eval_set,
-            canonicalize_hkl=args.canonicalize_hkl,
-            miller_index_offset=miller_index_offset,
-        )
-
-        # Print evaluation results
-        print("-" * 80)
-        print(f"Evaluation Results ({args.eval_set.upper()} Set, {name}):")
-        print(f"  Loss: {eval_metrics['loss']:.4f}")
-        print(f"  L_miller: {eval_metrics['loss_miller']:.4f}")
-        print(f"  L_lattice: {eval_metrics['loss_lattice']:.4f}")
-        print(f"  L_sg: {eval_metrics['loss_sg']:.4f}")
-        print(f"  Miller Acc: {eval_metrics['acc_all']:.2f}%")
-        print(f"  H Acc: {eval_metrics['acc_h']:.2f}%")
-        print(f"  K Acc: {eval_metrics['acc_k']:.2f}%")
-        print(f"  L Acc: {eval_metrics['acc_l']:.2f}%")
-        print(f"  SG Acc: {eval_metrics['sg_acc']:.2f}%")
-        print(f"  Lattice MAE A: {eval_metrics['lattice_mae_a']:.4f}")
-        print(f"  Lattice MAE Ang: {eval_metrics['lattice_mae_ang']:.4f}")
-        print("-" * 80)
-
-        # Save to subdirectory JSON
-        results_path = os.path.join(subdir, f'{args.eval_set}_evaluation_results.json')
-        serializable_metrics = {}
-        for key, value in eval_metrics.items():
-            if hasattr(value, 'item'):
-                serializable_metrics[key] = value.item()
-            else:
-                serializable_metrics[key] = value
-        with open(results_path, 'w', encoding='utf-8') as f:
-            json.dump(serializable_metrics, f, indent=2, ensure_ascii=False)
-
-        summary_results[name] = serializable_metrics
-        # Additionally save data for overlay plotting
-        with open(os.path.join(subdir, f'{args.eval_set}_extras.npy'), 'wb') as f:
-            np.save(f, {
-                'abc_errors': np.array(eval_extras['abc_errors'], dtype=np.float32),
-                'ang_errors': np.array(eval_extras['ang_errors'], dtype=np.float32),
-            }, allow_pickle=True)
-        # Save stats_by_sg as json (numerized)
-        stats_json = {str(k): {kk: int(vv) for kk, vv in v.items()} for k, v in eval_extras['stats_by_sg'].items()}
-        with open(os.path.join(subdir, f'{args.eval_set}_stats_by_sg.json'), 'w', encoding='utf-8') as f:
-            json.dump(stats_json, f, indent=2, ensure_ascii=False)
-
-        # Clean up data loader
-        del eval_loader
-        torch.cuda.empty_cache()
-
-    # Extra noisy evaluation on full-angle data
+    # 2) Noisy evaluation (micro + random noise points)
     if bool(getattr(args, 'noisy_eval_enable', True)):
-        print("--> Running extra NOISY evaluation on full-angle data")
+        print("--> Running extra NOISY evaluation on full-angle data (micro + random noise points)")
         subdir = os.path.join(root_save_dir, 'noisy')
         os.makedirs(subdir, exist_ok=True)
-        # Build full-angle loader
         _, eval_loader_noisy = _build_dataset_and_loader(eval_paths, miller_index_offset, args, fixed_clip_fraction=1.0)
         noisy_metrics, _ = evaluate(
             eval_loader_noisy,
@@ -1156,7 +1214,142 @@ def main():
         with open(os.path.join(subdir, f'{args.eval_set}_evaluation_results.json'), 'w', encoding='utf-8') as f:
             json.dump({k: (v.item() if hasattr(v, 'item') else v) for k, v in noisy_metrics.items()}, f, indent=2, ensure_ascii=False)
         del eval_loader_noisy
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        # Noisy vs clean comparison plot (PNG + EPS)
+        try:
+            def _plot_noisy_vs_clean_metrics(root_dir, eval_set_name):
+                clean_json = os.path.join(root_dir, '360deg', f'{eval_set_name}_evaluation_results.json')
+                noisy_json = os.path.join(root_dir, 'noisy', f'{eval_set_name}_evaluation_results.json')
+                if not (os.path.exists(clean_json) and os.path.exists(noisy_json)):
+                    return
+                with open(clean_json, 'r', encoding='utf-8') as f:
+                    clean = json.load(f)
+                with open(noisy_json, 'r', encoding='utf-8') as f:
+                    noisy = json.load(f)
+
+                acc_keys = [
+                    ('acc_all', 'Overall'),
+                    ('acc_h', 'H'),
+                    ('acc_k', 'K'),
+                    ('acc_l', 'L'),
+                    ('sg_acc', 'SG'),
+                ]
+                mae_keys = [
+                    ('lattice_mae_a', 'MAE abc (Å)'),
+                    ('lattice_mae_ang', 'MAE angles (°)'),
+                ]
+
+                acc_labels = [label for _, label in acc_keys]
+                acc_clean = [float(clean.get(k, 0.0)) for k, _ in acc_keys]
+                acc_noisy = [float(noisy.get(k, 0.0)) for k, _ in acc_keys]
+
+                mae_labels = [label for _, label in mae_keys]
+                mae_clean = [float(clean.get(k, 0.0)) for k, _ in mae_keys]
+                mae_noisy = [float(noisy.get(k, 0.0)) for k, _ in mae_keys]
+
+                plt.figure(figsize=(14, 5))
+                ax1 = plt.subplot(1, 2, 1)
+                x = np.arange(len(acc_labels))
+                width = 0.36
+                ax1.bar(x - width/2, acc_clean, width, label='Clean', color=sns.color_palette()[0], edgecolor='black', linewidth=0.5)
+                ax1.bar(x + width/2, acc_noisy, width, label='Noisy', color=sns.color_palette()[1], edgecolor='black', linewidth=0.5)
+                ax1.set_xticks(x)
+                ax1.set_xticklabels(acc_labels)
+                ax1.set_ylim(0, 100)
+                ax1.set_ylabel('Accuracy (%)')
+                ax1.set_title('HKL / SG Accuracy (360°)')
+                ax1.grid(True, axis='y', alpha=0.3)
+                ax1.legend()
+
+                ax2 = plt.subplot(1, 2, 2)
+                x2 = np.arange(len(mae_labels))
+                ax2.bar(x2 - width/2, mae_clean, width, label='Clean', color=sns.color_palette()[0], edgecolor='black', linewidth=0.5)
+                ax2.bar(x2 + width/2, mae_noisy, width, label='Noisy', color=sns.color_palette()[1], edgecolor='black', linewidth=0.5)
+                ax2.set_xticks(x2)
+                ax2.set_xticklabels(mae_labels)
+                ax2.set_ylabel('MAE')
+                ax2.set_title('Lattice Parameter MAE (360°)')
+                ax2.grid(True, axis='y', alpha=0.3)
+                ax2.legend()
+
+                plt.tight_layout()
+                out_path = os.path.join(root_dir, f'{eval_set_name}_noisy_vs_clean_metrics.png')
+                plt.savefig(out_path, dpi=300, bbox_inches='tight')
+                try:
+                    base, _ = os.path.splitext(out_path)
+                    plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+                except Exception:
+                    pass
+                plt.close()
+
+            _plot_noisy_vs_clean_metrics(root_save_dir, args.eval_set)
+        except Exception as _e:
+            print(f"Failed to generate noisy vs clean comparison: {_e}")
+
+    # 3) Angle range sensitivity (reuse baseline for 1.0 if present)
+    angle_ranges = args.angle_eval_ranges
+    for frac in angle_ranges:
+        name = f'{int(frac*360)}deg'
+        angle_name_map[frac] = name if frac != 1.0 else baseline_name
+        if frac == 1.0:
+            # already evaluated baseline
+            continue
+        subdir = os.path.join(root_save_dir, name)
+        os.makedirs(subdir, exist_ok=True)
+        _, eval_loader = _build_dataset_and_loader(eval_paths, miller_index_offset, args, fixed_clip_fraction=frac, fixed_density_divisor=None)
+        print(f"--> Starting evaluation of {args.eval_set} set, angle range: {name} ({frac*360:.2f}°)...")
+        eval_metrics, eval_extras = evaluate(
+            eval_loader,
+            model,
+            criterion,
+            subdir,
+            eval_set_name=args.eval_set,
+            canonicalize_hkl=args.canonicalize_hkl,
+            miller_index_offset=miller_index_offset,
+            apply_noise=False,
+            noise_prob=0.0,
+            noise_micro=float(getattr(args, 'noise_eval_micro', 0.01)),
+        )
+        print("-" * 80)
+        print(f"Evaluation Results ({args.eval_set.upper()} Set, {name}):")
+        print(f"  Loss: {eval_metrics['loss']:.4f}")
+        print(f"  L_miller: {eval_metrics['loss_miller']:.4f}")
+        print(f"  L_lattice: {eval_metrics['loss_lattice']:.4f}")
+        print(f"  L_sg: {eval_metrics['loss_sg']:.4f}")
+        print(f"  Miller Acc: {eval_metrics['acc_all']:.2f}%")
+        print(f"  H Acc: {eval_metrics['acc_h']:.2f}%")
+        print(f"  K Acc: {eval_metrics['acc_k']:.2f}%")
+        print(f"  L Acc: {eval_metrics['acc_l']:.2f}%")
+        print(f"  SG Acc: {eval_metrics['sg_acc']:.2f}%")
+        print(f"  Lattice MAE A: {eval_metrics['lattice_mae_a']:.4f}")
+        print(f"  Lattice MAE Ang: {eval_metrics['lattice_mae_ang']:.4f}")
+        print("-" * 80)
+        # Save to subdirectory JSON
+        results_path = os.path.join(subdir, f'{args.eval_set}_evaluation_results.json')
+        serializable_metrics = {k: (v.item() if hasattr(v, 'item') else v) for k, v in eval_metrics.items()}
+        with open(results_path, 'w', encoding='utf-8') as f:
+            json.dump(serializable_metrics, f, indent=2, ensure_ascii=False)
+        summary_results[name] = serializable_metrics
+        with open(os.path.join(subdir, f'{args.eval_set}_extras.npy'), 'wb') as f:
+            np.save(f, {
+                'abc_errors': np.array(eval_extras['abc_errors'], dtype=np.float32),
+                'ang_errors': np.array(eval_extras['ang_errors'], dtype=np.float32),
+            }, allow_pickle=True)
+        stats_json = {str(k): {kk: int(vv) for kk, vv in v.items()} for k, v in eval_extras['stats_by_sg'].items()}
+        with open(os.path.join(subdir, f'{args.eval_set}_stats_by_sg.json'), 'w', encoding='utf-8') as f:
+            json.dump(stats_json, f, indent=2, ensure_ascii=False)
+        del eval_loader
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    # Overlay plotting and angle overlays (reuse baseline for 1.0)
 
     # Write overall summary to main directory
     with open(os.path.join(root_save_dir, f'summary_{args.eval_set}.json'), 'w', encoding='utf-8') as f:
@@ -1214,6 +1407,11 @@ def main():
         ax1.legend(); ax2.legend()
         plt.tight_layout()
         plt.savefig(overlay_lattice_path, dpi=300, bbox_inches='tight')
+        try:
+            base, _ = os.path.splitext(overlay_lattice_path)
+            plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+        except Exception:
+            pass
         plt.close()
         # Also save a copy of angle-sensitivity lattice CDF into root directory
         try:
@@ -1288,6 +1486,11 @@ def main():
             plt.legend(loc='upper right', title='Angle Ranges')
             plt.tight_layout()
             plt.savefig(overlay_acc_paths[key], dpi=300, bbox_inches='tight')
+            try:
+                base, _ = os.path.splitext(overlay_acc_paths[key])
+                plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+            except Exception:
+                pass
             plt.close()
     except Exception as e:
         print(f"Failed to generate overlay plots: {e}")
@@ -1315,7 +1518,7 @@ def main():
     except Exception as e:
         print(f"Failed to generate grouped bars by cs: {e}")
 
-    # Density sensitivity study on full-angle data
+    # 4) Density sensitivity study on full-angle data (reuse baseline for divisor == 1)
     try:
         density_divs = [int(x) for x in getattr(args, 'density_eval_ranges', []) if int(x) >= 1]
         if len(density_divs) > 0:
@@ -1330,28 +1533,53 @@ def main():
                 dname = f'density_1_{div}'
                 subdir = os.path.join(root_save_dir, dname)
                 os.makedirs(subdir, exist_ok=True)
-                _, dloader = _build_dataset_and_loader(eval_paths, miller_index_offset, args, fixed_clip_fraction=None, fixed_density_divisor=div)
-                print(f"--> Starting evaluation of {args.eval_set} set, density: {dname} (1/{div})...")
-                d_metrics, d_extras = evaluate(
-                    dloader,
-                    model,
-                    criterion,
-                    subdir,
-                    eval_set_name=args.eval_set,
-                    canonicalize_hkl=args.canonicalize_hkl,
-                    miller_index_offset=miller_index_offset,
-                )
-                # Save density extras for overlay plotting
-                try:
-                    with open(os.path.join(subdir, f'{args.eval_set}_extras.npy'), 'wb') as f:
-                        np.save(f, {
-                            'abc_errors': np.array(d_extras.get('abc_errors', []), dtype=np.float32),
-                            'ang_errors': np.array(d_extras.get('ang_errors', []), dtype=np.float32),
-                        }, allow_pickle=True)
-                except Exception:
-                    pass
-                del dloader
-                torch.cuda.empty_cache()
+                if int(div) == 1:
+                    # Reuse baseline results: copy artifacts
+                    try:
+                        import shutil as _shutil
+                        # Copy core JSONs and plots if exist
+                        for fname in [
+                            f'{args.eval_set}_evaluation_results.json',
+                            f'{args.eval_set}_sample_details.json',
+                            f'{args.eval_set}_stats_by_sg.json',
+                            f'{args.eval_set}_extras.npy',
+                        ]:
+                            src = os.path.join(baseline_subdir, fname)
+                            dst = os.path.join(subdir, fname)
+                            if os.path.exists(src):
+                                _shutil.copyfile(src, dst)
+                    except Exception:
+                        pass
+                else:
+                    _, dloader = _build_dataset_and_loader(eval_paths, miller_index_offset, args, fixed_clip_fraction=None, fixed_density_divisor=div)
+                    print(f"--> Starting evaluation of {args.eval_set} set, density: {dname} (1/{div})...")
+                    d_metrics, d_extras = evaluate(
+                        dloader,
+                        model,
+                        criterion,
+                        subdir,
+                        eval_set_name=args.eval_set,
+                        canonicalize_hkl=args.canonicalize_hkl,
+                        miller_index_offset=miller_index_offset,
+                        apply_noise=False,
+                        noise_prob=0.0,
+                        noise_micro=float(getattr(args, 'noise_eval_micro', 0.01)),
+                    )
+                    # Save density extras for overlay plotting
+                    try:
+                        with open(os.path.join(subdir, f'{args.eval_set}_extras.npy'), 'wb') as f:
+                            np.save(f, {
+                                'abc_errors': np.array(d_extras.get('abc_errors', []), dtype=np.float32),
+                                'ang_errors': np.array(d_extras.get('ang_errors', []), dtype=np.float32),
+                            }, allow_pickle=True)
+                    except Exception:
+                        pass
+                    del dloader
+                    if torch.cuda.is_available():
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
 
             # Extra NOISY run on full-angle for density context (saved under 'noisy') is already executed above
 
@@ -1467,6 +1695,11 @@ def main():
                 ax1.legend(); ax2.legend()
                 plt.tight_layout()
                 plt.savefig(density_overlay_path, dpi=300, bbox_inches='tight')
+                try:
+                    base, _ = os.path.splitext(density_overlay_path)
+                    plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+                except Exception:
+                    pass
                 plt.close()
             except Exception:
                 pass
@@ -1508,6 +1741,11 @@ def main():
             plt.tight_layout()
             out_path = os.path.join(root_save_dir, f'{eval_set_name}_sg_confusion_{subdir_angle_name}.png')
             plt.savefig(out_path, dpi=300, bbox_inches='tight')
+            try:
+                base, _ = os.path.splitext(out_path)
+                plt.savefig(base + '.eps', format='eps', bbox_inches='tight')
+            except Exception:
+                pass
             plt.close()
         _plot_confusion_matrix_sg(root_save_dir, args.eval_set, '360deg')
     except Exception as e:
@@ -1516,5 +1754,9 @@ def main():
     print("Evaluation completed.")
 
 if __name__ == '__main__':
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
     main()

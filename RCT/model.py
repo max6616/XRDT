@@ -287,12 +287,22 @@ class Embedding(PointModule):
         return self.stem(point)
 
 class PointTransformerV3(PointModule):
+    # def __init__(
+    #     self, in_channels=6, order=("z", "z-trans", "hilbert", "hilbert-trans"), stride=(2, 2, 2, 2, 2),
+    #     enc_depths=(4, 6, 8, 6, 4, 2), enc_channels=(64, 128, 256, 512, 1024, 2048),
+    #     enc_num_head=(2, 4, 8, 16, 32, 32), enc_patch_size=(512, 512, 512, 512, 512, 512),
+    #     dec_depths=(6, 6, 6, 6, 6), dec_channels=(128, 128, 256, 512, 1024),
+    #     dec_num_head=(4, 4, 8, 16, 32), dec_patch_size=(512, 512, 512, 512, 512),
+    #     mlp_ratio=4, qkv_bias=True, qk_scale=None, attn_drop=0.0, proj_drop=0.0, drop_path=0.3,
+    #     pre_norm=True, shuffle_orders=True, enable_rpe=False, enable_flash=True,
+    #     upcast_attention=False, upcast_softmax=False, cls_mode=False
+    # ):
     def __init__(
         self, in_channels=6, order=("z", "z-trans"), stride=(2, 2, 2, 2),
         enc_depths=(4, 6, 4, 3, 2), enc_channels=(64, 128, 256, 512, 1024),
-        enc_num_head=(2, 4, 8, 16, 32), enc_patch_size=(48, 48, 48, 48, 48),
+        enc_num_head=(2, 4, 8, 16, 32), enc_patch_size=(1024, 1024, 1024, 1024, 1024),
         dec_depths=(4, 4, 4, 4, 4), dec_channels=(64, 128, 256, 512),
-        dec_num_head=(2, 4, 8, 16), dec_patch_size=(48, 48, 48, 48),
+        dec_num_head=(2, 4, 8, 16), dec_patch_size=(1024, 1024, 1024, 1024),
         mlp_ratio=4, qkv_bias=True, qk_scale=None, attn_drop=0.0, proj_drop=0.0, drop_path=0.0,
         pre_norm=True, shuffle_orders=True, enable_rpe=False, enable_flash=True,
         upcast_attention=False, upcast_softmax=False, cls_mode=False
@@ -367,7 +377,7 @@ class PointTransformerV3(PointModule):
             return {"encoder_output": true_encoder_output, "decoder_output": decoder_output}
         return encoder_output
 
-class XRDT(nn.Module):
+class RCT(nn.Module):
     def __init__(self, in_channels=7, num_classes=11, **kwargs):
         super().__init__()
         

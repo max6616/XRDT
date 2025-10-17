@@ -10,7 +10,9 @@ from torch.utils.data import IterableDataset, DataLoader
 
 class MillerDataset(IterableDataset):
     def __init__(self, paths, miller_index_offset, augment_angle=False, augment_scale=False, 
-                 scale_range=(0.9, 1.1), max_points=8192, debug=0, abs_label=False, norm_scale=False, fixed_clip_fraction=None, fixed_density_divisor=None):
+                 scale_range=(0.9, 1.1), max_points=8192, debug=0, abs_label=False, norm_scale=False, fixed_clip_fraction=None, fixed_density_divisor=None,
+                 lattice_stats_json=None, lattice_mean=None, lattice_std=None,
+                 intensity_mean=None, intensity_std=None):
         super(MillerDataset, self).__init__()
         
         # Support single path or list of paths
@@ -29,7 +31,7 @@ class MillerDataset(IterableDataset):
             if not path_files:
                 print(f"Warning: No '.jsonl' files found in directory {path}.")
             else:
-                print(f"--> Loaded {len(path_files)} files from {path}")
+                # print(f"--> Loaded {len(path_files)} files from {path}")
                 self.files.extend(path_files)
         
         if debug > 0: 
@@ -48,6 +50,38 @@ class MillerDataset(IterableDataset):
         self.norm_scale = norm_scale
         self.fixed_clip_fraction = fixed_clip_fraction
         self.fixed_density_divisor = fixed_density_divisor
+
+        # Intensity standardization params (if provided, use (I-mean)/std; else fallback to divide-by-10)
+        self.intensity_mean = None if intensity_mean is None else float(intensity_mean)
+        self.intensity_std = None if intensity_std is None else float(intensity_std)
+
+        # Lattice normalization stats (mean/std per a,b,c,alpha,beta,gamma)
+        self.lattice_mean = None
+        self.lattice_std = None
+        if lattice_mean is not None and lattice_std is not None:
+            self.lattice_mean = torch.tensor(list(lattice_mean), dtype=torch.float)
+            self.lattice_std = torch.tensor(list(lattice_std), dtype=torch.float)
+        elif lattice_stats_json is not None and os.path.isfile(lattice_stats_json):
+            try:
+                with open(lattice_stats_json, 'r', encoding='utf-8') as f:
+                    stats_payload = json.load(f)
+                stats = stats_payload.get('stats', {})
+                order = ['a', 'b', 'c', 'alpha', 'beta', 'gamma']
+                means = [float(stats[k].get('mean', 0.0)) for k in order]
+                stds = [float(stats[k].get('std', 1.0)) for k in order]
+                # Avoid zero std
+                stds = [s if abs(s) > 1e-8 else 1.0 for s in stds]
+                self.lattice_mean = torch.tensor(means, dtype=torch.float)
+                self.lattice_std = torch.tensor(stds, dtype=torch.float)
+                print(f"--> Loaded lattice stats from {lattice_stats_json}")
+            except Exception as e:
+                print(f"Warning: failed to load lattice stats '{lattice_stats_json}': {e}")
+                self.lattice_mean, self.lattice_std = None, None
+        # Fallback: legacy coarse scaling if no stats provided
+        if self.lattice_mean is None or self.lattice_std is None:
+            self.lattice_mean = torch.zeros(6, dtype=torch.float)
+            self.lattice_std = torch.tensor([10.0, 10.0, 10.0, 180.0, 180.0, 180.0], dtype=torch.float)
+            print("--> Lattice stats not provided; using legacy coarse scaling [0 mean, std=(10,10,10,180,180,180)]")
         
         print(f"--> Total files loaded: {len(self.files)}")
         if self.norm_scale:
@@ -131,16 +165,19 @@ class MillerDataset(IterableDataset):
                 if num_points == 0: continue
                 
                 crystal_params_raw = data.get('metadata', {}).get('crystal_params', None)
-                if crystal_params_raw:
-                    lengths = torch.tensor([float(p) for p in crystal_params_raw.values()][:3]) / 10.0
-                    angles = torch.tensor([float(p) for p in crystal_params_raw.values()][3:6]) / 180.0
-                    lattice_labels = torch.cat([lengths, angles])
-                    sg_label = torch.tensor([int(crystal_params_raw['_symmetry_Int_Tables_number']) - 1], dtype=torch.long)
-                    crystal_labels = {'lattice': lattice_labels, 'space_group': sg_label}
-                else:
-                    crystal_labels = {'lattice': torch.zeros(6), 'space_group': torch.tensor([-1], dtype=torch.long)}
+                raw_vals = torch.tensor([float(p) for p in crystal_params_raw.values()][:6], dtype=torch.float)
+                # Standardize using dataset stats
+                lattice_labels = (raw_vals - self.lattice_mean) / self.lattice_std
+                sg_label = torch.tensor([int(crystal_params_raw['_symmetry_Int_Tables_number']) - 1], dtype=torch.long)
+                crystal_labels = {'lattice': lattice_labels, 'space_group': sg_label}
 
-                points[:, 3] = points[:, 3] / 10.0
+                assert torch.max(sg_label) <= 229 and torch.min(sg_label) >= 0
+                
+                # Intensity transform: standardize if mean/std provided; otherwise fallback to divide-by-10
+                if (self.intensity_mean is not None) and (self.intensity_std is not None) and (abs(self.intensity_std) > 1e-12):
+                    points[:, 3] = (points[:, 3] - float(self.intensity_mean)) / float(self.intensity_std)
+                else:
+                    points[:, 3] = points[:, 3] / 10.0
                 if points.shape[0] > self.max_points:
                     points = points[:self.max_points]
                     labels = labels[:self.max_points, :]
@@ -149,6 +186,8 @@ class MillerDataset(IterableDataset):
                     labels = torch.abs(labels)
                 else:
                     labels += self.miller_index_offset
+                
+                assert torch.max(labels) <= 10 and torch.min(labels) >= 0
 
                 # Sample info
                 sample_info = {
