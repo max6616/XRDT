@@ -1,4 +1,5 @@
-from datad import *
+from datad import UnitCell, SingleXtal, Xray, Pattern2D
+from detector import Detector
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -13,13 +14,13 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from utils import reset_seed
 import math
 import gc
-from functools import partial # <-- 确保在文件顶部添加此行
+from functools import partial
 
 
 def args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cif_path', type=str, default='/media/max/Data/datasets/mp_all')
-    parser.add_argument('--save_path', type=str, default='/media/max/Data/datasets/mp_random_150k_v3')
+    parser.add_argument('--save_path', type=str, default='/media/max/Data/datasets/mp_random_150k_test')
     parser.add_argument('--debug', type=int, default=0, help='Debug mode, randomly sample n cif files')
     parser.add_argument('--num_workers', type=int, default=28, help='Number of parallel workers')
     parser.add_argument('--angle_step', type=float, default=0.5, help='Angle step (degrees)')

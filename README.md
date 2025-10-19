@@ -4,9 +4,10 @@ This repo is the official project repository of the paper ***Rapid Structure-agn
 
 Authors: 
 
-## Environment Setup
+## Installation
 
-我们建议对数据模拟部分和模型训练部分使用分别的环境，避免潜在环境冲突问题。对于论文结果复现，你可以跳过数据模拟步骤，直接使用RC-400K数据集进行训练和测试。数据集将在论文建刊后开源。
+我们建议对数据模拟部分和模型训练部分使用分别的环境避免潜在环境冲突问题，建议使用Nvidia BlackWell架构GPU，如GeForce RTX 50 Series。。如果只是复现论文结果，你可以跳过数据模拟步骤直接使用RC-400K数据集。数据集将在论文建刊后开源。
+
 Prerequisites [[uv](https://astral.sh/uv/)] [[mamba](https://mamba.readthedocs.io/)]
 
 ### Simulator Environment
@@ -43,15 +44,18 @@ cd ../..
 ## Run
 
 <details>
-<summary> Produce simulate reflection cloud dataset</summary>
+<summary> Produce simulated reflection cloud dataset</summary>
 
 </details>
 
 ## Links
 
-We use [DATAD](https://datad.netlify.app/) as our XRD simulator.
-RCT is based on [PointTransformerV3](https://github.com/Pointcept/PointTransformerV3), 并从[pointcept](https://github.com/Pointcept/Pointcept)中借鉴了相关实现。
+RCT is based on [PointTransformerV3](https://github.com/Pointcept/PointTransformerV3), 并使用了[pointcept](https://github.com/Pointcept/Pointcept)的代码实现。
 
+**Point Transformer V3: Simpler, Faster, Stronger**
+Xiaoyang Wu, Li Jiang, Peng-Shuai Wang, Zhijian Liu, Xihui Liu, Yu Qiao, Wanli Ouyang, Tong He, Hengshuang Zhao.
+IEEE Conference on Computer Vision and Pattern Recognition (CVPR) 2024.
+[[paper](https://arxiv.org/pdf/2312.10035)] [[code](https://github.com/Pointcept/PointTransformerV3)] [[pointcept](https://github.com/Pointcept/Pointcept)]
 
 ## Bibtex
 
