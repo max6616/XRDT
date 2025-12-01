@@ -25,7 +25,7 @@ filterwarnings("ignore", category=UserWarning)
 
 def reset_seed():
     # Use bitmask to ensure value range
-    main_seed = (int(time.time() * 1000) + os.getpid() + threading.get_ident()) & 0xFFFFFFFF
+    main_seed = (time.time_ns() + os.getpid() + threading.get_ident()) & 0xFFFFFFFF
     np.random.seed(main_seed)
     random.seed(main_seed + 1)
 

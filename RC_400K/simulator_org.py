@@ -10,7 +10,6 @@ import random
 import time
 import threading
 import multiprocessing as mp
-from ase.io import read as ase_read
 from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from utils import reset_seed
 import math
@@ -21,26 +20,21 @@ from functools import partial
 def args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cif_path', type=str, default='/media/max/Data/datasets/mp_all')
-    parser.add_argument('--save_path', type=str, default='/media/max/Data/datasets/mp_random_450k_tmp')
-    parser.add_argument('--debug', type=int, default=100, help='Debug mode, randomly sample n cif files')
-    parser.add_argument('--num_workers', type=int, default=8, help='Number of parallel workers')
+    parser.add_argument('--save_path', type=str, default='/media/max/Data/datasets/mp_random_150k_test')
+    parser.add_argument('--debug', type=int, default=0, help='Debug mode, randomly sample n cif files')
+    parser.add_argument('--num_workers', type=int, default=28, help='Number of parallel workers')
     parser.add_argument('--angle_step', type=float, default=0.5, help='Angle step (degrees)')
     parser.add_argument('--val_ratio', type=float, default=0.05, help='Validation set ratio')
     parser.add_argument('--test_ratio', type=float, default=0.01, help='Test set ratio')
-    parser.add_argument('--min_sequence_length', type=int, default=2048, help='Minimum sequence length')
-    parser.add_argument('--max_sequence_length', type=int, default=65536, help='Maximum sequence length')
-    parser.add_argument('--samples-per-cif', type=int, default=2,
-                        help='Number of independent simulations to run per CIF file')
+    parser.add_argument('--min_sequence_length', type=int, default=1024, help='Minimum sequence length')
+    parser.add_argument('--max_sequence_length', type=int, default=32768, help='Maximum sequence length')
 
-    # Device parameters (matched to PerkinElmer XRD 1621 @ DESY P21 beamline)
-    parser.add_argument('--detector_size', type=tuple, default=(2048, 2048), help='Detector size [sizex, sizey]')
-    parser.add_argument('--detector_dist', type=tuple, default=(390, 410), help='Detector distance range [min, max] (mm)')
-    parser.add_argument('--detector_poni', type=tuple, default=(1030, 1035, 1035, 1039), help='Detector center range [ponix_min, ponix_max, poniy_min, poniy_max]')
-    parser.add_argument('--xray_wavelength', type=float, default=0.290, help='X-ray wavelength (Angstrom)')
+    # Device parameters
+    parser.add_argument('--detector_size', type=tuple, default=(2560, 2560), help='Detector size [sizex, sizey]')
+    parser.add_argument('--detector_dist', type=tuple, default=(500, 500), help='Detector distance range [min, max]')
+    parser.add_argument('--detector_poni', type=tuple, default=(1280, 1280, 1280, 1280), help='Detector center range [ponix_min, ponix_max, poniy_min, poniy_max]')
+    parser.add_argument('--xray_wavelength', type=float, default=0.413, help='X-ray wavelength')
     parser.add_argument('--xray_bandwidth', type=float, default=0.02, help='X-ray bandwidth')
-    
-    # HKL range for reciprocal space calculation
-    parser.add_argument('--hkl_range', type=tuple, default=(10, 10, 10), help='HKL range for reciprocal space calculation')
     
     # Additional crystal parameters to record
     parser.add_argument('--extra_params', default=[
@@ -86,50 +80,19 @@ def random_detector_setup(args):
     return detector_params, xray_params
 
 
-def load_unitcell_ase(cif_file):
-    """
-    Load CIF file and create UnitCell using ASE method (verified more accurate than from_cif).
-    Returns UnitCell object or None if failed.
-    """
-    try:
-        ase_atoms = ase_read(cif_file)
-        lattice_params = ase_atoms.cell.cellpar()  # [a, b, c, alpha, beta, gamma]
-        elements = ase_atoms.get_chemical_symbols()
-        fractional_coords = ase_atoms.get_scaled_positions() % 1.0  # normalize to [0, 1)
-        
-        atoms_list = [
-            (elem, pos.tolist()) 
-            for elem, pos in zip(elements, fractional_coords)
-        ]
-        
-        return UnitCell.from_array(lattice_params, atoms_list, is_degree=True)
-        
-    except Exception as e:
-        return None
-
-
-def collect_diffraction_sequence(cif_file, detector_params, xray_params, angle_step=0.1, hkl_range=(15, 15, 15)):
+def collect_diffraction_sequence(cif_file, detector_params, xray_params, angle_step=0.1):
     """
     Collect diffraction sequence data for complete 360 degree rotation
-    
-    Args:
-        cif_file: CIF file path
-        detector_params: Detector configuration dict
-        xray_params: X-ray source parameters
-        angle_step: Rotation step in degrees
-        hkl_range: HKL range for reciprocal space calculation (h_max, k_max, l_max)
     """
     try:
-        # Initialize crystal and device using ASE method
-        unitcell = load_unitcell_ase(cif_file)
-        if unitcell is None:
+        # Initialize crystal and device
+        try:
+            unitcell = UnitCell.from_cif(cif_file)
+        except Exception as e:
+            # print(f"Error reading CIF file {cif_file}: {str(e)}")
             return None, None, None, None
         xtal = SingleXtal.random(unitcell)
         # xtal = SingleXtal.from_rcp_vectors(unitcell, x=(1, 0, 0), y=(0, 1, 0), z=(0, 0, 1))
-        
-        # Calculate reciprocal space with specified HKL range
-        xtal.calc_rcp_space(hklrange=hkl_range)
-        
         detector = Detector(**detector_params)
         xray = Xray.Gaussian(**xray_params)
         
@@ -234,7 +197,7 @@ def process_single_cif(args, cif_file):
         detector_params, xray_params = random_detector_setup(args)
         
         peaks_data, final_detector_params, unitcell, xtal = collect_diffraction_sequence(
-            cif_file, detector_params, xray_params, args.angle_step, args.hkl_range
+            cif_file, detector_params, xray_params, args.angle_step
         )
         
         if peaks_data is None or len(peaks_data) < args.min_sequence_length:
@@ -346,22 +309,18 @@ def process_and_save_and_count(cif_file, args, output_dir, split_name, counter, 
     """
     这个辅助函数封装了处理和保存单个文件的逻辑，并安全地更新计数器。
     """
-    repeats = max(1, getattr(args, 'samples_per_cif', 1))
-    success = False
-    for repeat_idx in range(repeats):
-        try:
-            result = process_single_cif(args, cif_file)
-            if result is None:
-                continue
+    try:
+        result = process_single_cif(args, cif_file)
+        if result is not None:
             # 3. 使用正确的锁对象来保护计数器的“读-改-写”操作
             with lock:
                 current_index = counter.value
                 counter.value += 1
             save_single_sample(result, output_dir, split_name, current_index)
-            success = True
-        except Exception as e:
-            tqdm.write(f"A task failed for {os.path.basename(cif_file)} (repeat {repeat_idx + 1}): {e}")
-    return success
+            return True # 表示成功
+    except Exception as e:
+        print(f"A task failed for {os.path.basename(cif_file)}: {e}")
+    return False # 表示失败
 
 
 def main(args):

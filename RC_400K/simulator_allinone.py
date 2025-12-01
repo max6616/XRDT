@@ -38,20 +38,24 @@ def parse_args():
     # Simulator options (kept compatible with simulator.py)
     parser.add_argument('--cif_path', type=str, default='/media/max/Data/datasets/mp_all')
     parser.add_argument('--save_path', type=str, default=None)
-    parser.add_argument('--debug', type=int, default=500)
-    parser.add_argument('--num_workers', type=int, default=32)
+    parser.add_argument('--debug', type=int, default=-1)
+    parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--angle_step', type=float, default=0.5)
     parser.add_argument('--val_ratio', type=float, default=0.05)
     parser.add_argument('--test_ratio', type=float, default=0.01)
-    parser.add_argument('--min_sequence_length', type=int, default=1024)
-    parser.add_argument('--max_sequence_length', type=int, default=32768)
+    parser.add_argument('--min_sequence_length', type=int, default=2048)
+    parser.add_argument('--max_sequence_length', type=int, default=16384)
+    parser.add_argument('--samples-per-cif', type=int, default=1,
+                        help='Number of independent simulations to run per CIF file')
 
     # Device parameters
-    parser.add_argument('--detector_size', type=tuple, default=(2560, 2560))
-    parser.add_argument('--detector_dist', type=tuple, default=(500, 500))
-    parser.add_argument('--detector_poni', type=tuple, default=(1280, 1280, 1280, 1280))
-    parser.add_argument('--xray_wavelength', type=float, default=0.413)
+    parser.add_argument('--detector_size', type=tuple, default=(2048, 2048))
+    parser.add_argument('--detector_dist', type=tuple, default=(390, 410))
+    parser.add_argument('--detector_poni', type=tuple, default=(1030, 1035, 1035, 1039))
+    parser.add_argument('--xray_wavelength', type=float, default=0.290)
     parser.add_argument('--xray_bandwidth', type=float, default=0.02)
+    parser.add_argument('--hkl_range', type=tuple, default=(10, 10, 10))
+
 
     # Additional crystal parameters to record from CIF files
     parser.add_argument('--extra_params', default=[
@@ -71,7 +75,7 @@ def parse_args():
     parser.add_argument('--no-inline', dest='inline', action='store_false',
                         help='Disable inline canonicalization; use two-pass mode')
     parser.set_defaults(inline=True)
-    parser.add_argument('--canon_output_dir', type=str, default='/media/max/Data/datasets/all_in_one_test',
+    parser.add_argument('--canon_output_dir', type=str, default='/media/max/Data/datasets/mp_random_450k_ihep_tmp',
                         help='Output root directory for canonicalized dataset. '
                              'Default: save_path + "_canonical"')
     parser.add_argument('--canon_ext', type=str, default='.jsonl',
@@ -274,19 +278,23 @@ def canonicalize_sample_inplace(sample):
 
 def process_and_save_and_count_inline(cif_file, args, output_dir, split_name, counter, lock):
     """Worker: simulate one CIF, canonicalize labels, then save."""
-    try:
-        result = process_single_cif(args, cif_file)
-        if result is not None:
+    repeats = max(1, getattr(args, 'samples_per_cif', 1))
+    success = False
+    for repeat_idx in range(repeats):
+        try:
+            result = process_single_cif(args, cif_file)
+            if result is None:
+                continue
             canonicalize_sample_inplace(result)
             with lock:
                 current_index = counter.value
                 counter.value += 1
             save_single_sample(result, output_dir, split_name, current_index)
-            return True
-    except Exception as e:
-        # Keep logs concise in large-scale processing
-        tqdm.write(f"A task failed for {os.path.basename(cif_file)}: {e}")
-    return False
+            success = True
+        except Exception as e:
+            # Keep logs concise in large-scale processing
+            tqdm.write(f"A task failed for {os.path.basename(cif_file)} (repeat {repeat_idx + 1}): {e}")
+    return success
 
 
 def process_and_save_split_inline(args, cif_files, split_name, output_root_dir):
