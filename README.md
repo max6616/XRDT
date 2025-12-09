@@ -50,12 +50,7 @@ cd ../..
 
 ## Links
 
-RCT is based on [PointTransformerV3](https://github.com/Pointcept/PointTransformerV3), 并使用了[pointcept](https://github.com/Pointcept/Pointcept)的代码实现。
-
-**Point Transformer V3: Simpler, Faster, Stronger**
-Xiaoyang Wu, Li Jiang, Peng-Shuai Wang, Zhijian Liu, Xihui Liu, Yu Qiao, Wanli Ouyang, Tong He, Hengshuang Zhao.
-IEEE Conference on Computer Vision and Pattern Recognition (CVPR) 2024.
-[[paper](https://arxiv.org/pdf/2312.10035)] [[code](https://github.com/Pointcept/PointTransformerV3)] [[pointcept](https://github.com/Pointcept/Pointcept)]
+RCT is based on [PointTransformerV3](https://arxiv.org/pdf/2312.10035), 并使用了[pointcept](https://github.com/Pointcept/Pointcept)的代码实现。
 
 ## Bibtex
 
